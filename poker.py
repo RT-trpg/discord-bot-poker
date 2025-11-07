@@ -7,15 +7,50 @@ import io, os, random, asyncio
 from itertools import combinations
 import logging
 
-# ====== 기본 설정 ======
-try:
-    from config import BOT_TOKEN
-except ImportError:
-    BOT_TOKEN = "여기에_토큰"  # config.py를 만들어 토큰을 분리 보관하는 걸 추천!
-intents = discord.Intents.all()
+# ====== 로깅 ======
+logging.basicConfig(level=logging.INFO)
+
+# ====== 인텐트 최소 권한 권장 ======
+intents = discord.Intents.default()
+intents.message_content = True   # 메시지 내용 접근이 필요한 경우
+intents.members = True           # 길드 멤버 정보가 필요한 경우만 True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-logging.basicConfig(level=logging.INFO)
+# ====== 봇 준비 이벤트 ======
+@bot.event
+async def on_ready():
+    logging.info(f"Logged in as {bot.user}")
+
+# 슬래시 명령(app_commands) 사용 시, 시작할 때 동기화해 두면 편해요
+@bot.event
+async def setup_hook():
+    try:
+        synced = await bot.tree.sync()
+        logging.info("Slash commands synced: %s", [c.name for c in synced])
+    except Exception as e:
+        logging.exception("Slash sync failed: %s", e)
+
+# ====== 예시 슬래시 커맨드 ======
+@bot.tree.command(name="ping", description="핑 확인")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong!")
+
+# ====== 실행부: 환경변수에서 토큰 읽기 ======
+if __name__ == "__main__":
+    token = os.getenv("TOKEN")
+    if not token:
+        # 로컬 개발에서 .env를 쓴다면 주석 해제 후 사용 가능
+        # from dotenv import load_dotenv
+        # load_dotenv()
+        # token = os.getenv("TOKEN")
+        # if not token:
+        raise RuntimeError(
+            "환경변수 TOKEN이 없습니다 — 로컬에선 `$env:TOKEN=...` 설정 후 실행하거나, "
+            "Railway Variables에 TOKEN을 추가해 주세요"
+        )
+    bot.run(token)
+
 
 # ====== 카드 이미지 경로/크기 ======
 CARDS_DIR = r"C:\Users\서나영\Desktop\봇\card"  # 예: As.png, 10h.png ...
