@@ -26,31 +26,15 @@ async def on_ready():
 @bot.event
 async def setup_hook():
     try:
+        # DB 스키마 준비
+        await init_db()
+
+        # 슬래시 명령 동기화 (이 파일에 정의된 명령들이 등록됨)
         synced = await bot.tree.sync()
         logging.info("Slash commands synced: %s", [c.name for c in synced])
+
     except Exception as e:
-        logging.exception("Slash sync failed: %s", e)
-
-# ====== 예시 슬래시 커맨드 ======
-@bot.tree.command(name="ping", description="핑 확인")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
-
-# ====== 실행부: 환경변수에서 토큰 읽기 ======
-if __name__ == "__main__":
-    token = os.getenv("TOKEN")
-    if not token:
-        # 로컬 개발에서 .env를 쓴다면 주석 해제 후 사용 가능
-        # from dotenv import load_dotenv
-        # load_dotenv()
-        # token = os.getenv("TOKEN")
-        # if not token:
-        raise RuntimeError(
-            "환경변수 TOKEN이 없습니다 — 로컬에선 `$env:TOKEN=...` 설정 후 실행하거나, "
-            "Railway Variables에 TOKEN을 추가해 주세요"
-        )
-    bot.run(token)
-
+        logging.exception("setup_hook failed: %s", e)
 
 # ====== 카드 이미지 경로/크기 ======
 CARDS_DIR = os.getenv("CARDS_DIR", "./cards")  # 레포에 cards 폴더를 넣어 배포
@@ -836,3 +820,19 @@ async def 강제종료(inter: discord.Interaction):
         await db.commit()
     await end_game()
     await inter.response.send_message("🛑 게임 강제 종료")
+
+
+# ====== 실행부: 환경변수에서 토큰 읽기 ======
+if __name__ == "__main__":
+    token = os.getenv("TOKEN")
+    if not token:
+        # 로컬 개발에서 .env를 쓴다면 주석 해제 후 사용 가능
+        # from dotenv import load_dotenv
+        # load_dotenv()
+        # token = os.getenv("TOKEN")
+        # if not token:
+        raise RuntimeError(
+            "환경변수 TOKEN이 없습니다 — 로컬에선 `$env:TOKEN=...` 설정 후 실행하거나, "
+            "Railway Variables에 TOKEN을 추가해 주세요"
+        )
+    bot.run(token)
