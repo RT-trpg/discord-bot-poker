@@ -1087,6 +1087,9 @@ async def 상태(inter: discord.Interaction):
 
 @bot.tree.command(name="강제종료", description="게임 강제 종료 (관리자)")
 async def 강제종료(inter: discord.Interaction):
+    # [수정] global 선언을 함수 맨 위로 이동
+    global game, players
+
     if not inter.user.guild_permissions.administrator:
         await inter.response.send_message("관리자만 가능!", ephemeral=True); return
     
@@ -1107,7 +1110,7 @@ async def 강제종료(inter: discord.Interaction):
         await db.commit()
 
     # 메모리 초기화 (end_game은 players를 유지하므로, 수동 초기화)
-    global game, players
+    # global game, players # [수정] 이 줄을 함수 맨 위로 옮겼습니다.
     players = {}
     game = {
         "deck": [], "community": [], "pot": 0, "round": None,
