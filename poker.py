@@ -280,14 +280,15 @@ async def prompt_action(channel):
 
     # 턴이 돌아올 때마다 120초 타이머 리셋
     deadline = datetime.utcnow() + timedelta(seconds=120)
-    game["deadline_ts"] = int(deadline.timestamp())
+    game["deadline_ts"] = int(deadline.timestamp()) # [버그 수정] 턴마다 고유한 마감 시간 생성
 
     base_text = (
         f"🎯 **{p['name']}**의 차례!\n"
         f"라운드: **{game['round'] or 'preflop'}** / 팟: **{game['pot']}** / "
         f"콜 필요: **{need_to_call}** / 보유: **{p['coins']}**"
     )
-    view = ActionPromptView(actor_id=uid) # 120초 타임아웃 뷰 생성
+    # [버그 수정] 고유한 마감 시간을 뷰에도 전달
+    view = ActionPromptView(actor_id=uid, deadline_ts=game["deadline_ts"])
     msg = await channel.send(
         base_text + f"\n⏳ 마감: <t:{game['deadline_ts']}:R> (<t:{game['deadline_ts']}:T>)",
         view=view
@@ -793,14 +794,23 @@ class RaiseModal(discord.ui.Modal, title="레이즈 금액 입력"):
 
 class ActionPromptView(discord.ui.View):
     """공개 '행동하기' 버튼 → 현재 차례인 유저만 누를 수 있음(검증 후 에페메럴 버튼 제공)"""
-    def __init__(self, actor_id: int, timeout=120): # 120초 타임아웃
-        super().__init__(timeout=timeout); self.actor_id = actor_id
+    # [버그 수정] 턴마다 고유한 deadline_ts를 받도록 수정
+    def __init__(self, actor_id: int, deadline_ts: int, timeout=120):
+        super().__init__(timeout=timeout)
+        self.actor_id = actor_id
+        self.deadline_ts = deadline_ts # 이 뷰가 생성된 시점의 마감 시간
     
     async def on_timeout(self):
         """
         뷰 자체가 타임아웃 (플레이어가 '행동하기' 버튼조차 누르지 않음)
         """
-        logging.info(f"ActionPromptView timed out for {self.actor_id}")
+        logging.info(f"ActionPromptView timed out for {self.actor_id} (ts={self.deadline_ts})")
+        
+        # [버그 수정] 이 타임아웃이 현재 게임 턴의 타임아웃인지 확인
+        if self.deadline_ts != game.get("deadline_ts"):
+            logging.warning(f"유령 타임아웃(PromptView) 무시: {self.actor_id} (뷰: {self.deadline_ts}, 게임: {game.get('deadline_ts')})")
+            return
+            
         # 타임아웃 시 자동으로 폴드 처리
         await handle_afk_fold(self.actor_id)
 
@@ -817,16 +827,25 @@ class ActionPromptView(discord.ui.View):
         current_actor = game["turn_order"][game["idx"]]
         if current_actor != self.actor_id:
             await interaction.response.send_message(f"이미 턴이 지나갔어요! (현재: {players.get(current_actor, {}).get('name', '알수없음')})", ephemeral=True); return False
+        
+        # [버그 수정] 이 뷰가 현재 턴의 뷰인지 확인
+        if self.deadline_ts != game.get("deadline_ts"):
+            await interaction.response.send_message("이전 턴의 버튼입니다. 새로고침/채팅방을 확인하세요.", ephemeral=True); return False
+
         return True
     
     @discord.ui.button(label="🎰 행동하기", style=discord.ButtonStyle.primary)
     async def _open_actions(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("액션을 선택하세요:", view=ActionView(self.actor_id), ephemeral=True)
+        # [버그 수정] ActionView에도 고유한 deadline_ts 전달
+        await interaction.response.send_message("액션을 선택하세요:", view=ActionView(self.actor_id, self.deadline_ts), ephemeral=True)
 
 class ActionView(discord.ui.View):
     """에페메럴: 체크/콜/레이즈/폴드"""
-    def __init__(self, actor_id: int, timeout=120): # 120초 타임아웃
-        super().__init__(timeout=timeout); self.actor_id = actor_id
+    # [버그 수정] 턴마다 고유한 deadline_ts를 받도록 수정
+    def __init__(self, actor_id: int, deadline_ts: int, timeout=120):
+        super().__init__(timeout=timeout)
+        self.actor_id = actor_id
+        self.deadline_ts = deadline_ts # 이 뷰가 생성된 시점의 마감 시간
         
         # 버튼 활성화/비활성화 로직
         p = players.get(actor_id)
@@ -845,7 +864,13 @@ class ActionView(discord.ui.View):
         """
         에페메럴 뷰 타임아웃 ('행동하기'는 눌렀으나 최종 선택을 안 함)
         """
-        logging.info(f"ActionView timed out for {self.actor_id}")
+        logging.info(f"ActionView timed out for {self.actor_id} (ts={self.deadline_ts})")
+
+        # [버그 수정] 이 타임아웃이 현재 게임 턴의 타임아웃인지 확인
+        if self.deadline_ts != game.get("deadline_ts"):
+            logging.warning(f"유령 타임아웃(ActionView) 무시: {self.actor_id} (뷰: {self.deadline_ts}, 게임: {game.get('deadline_ts')})")
+            return
+
         # 타임아웃 시 자동으로 폴드 처리
         await handle_afk_fold(self.actor_id)
 
@@ -859,6 +884,10 @@ class ActionView(discord.ui.View):
         if interaction.user.id != self.actor_id or current_actor != self.actor_id:
             await interaction.response.send_message("당신의 턴이 아니거나 턴이 지났습니다.", ephemeral=True); return False
             
+        # [버그 수정] 이 뷰가 현재 턴의 뷰인지 확인
+        if self.deadline_ts != game.get("deadline_ts"):
+            await interaction.response.send_message("이전 턴의 버튼입니다. 새로고침/채팅방을 확인하세요.", ephemeral=True); return False
+
         return True
     
     @discord.ui.button(label="체크", style=discord.ButtonStyle.secondary)
