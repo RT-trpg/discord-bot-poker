@@ -372,6 +372,9 @@ async def advance_or_next_round(channel):
 
 
 async def end_game():
+    # [수정] global 선언을 함수 맨 위로 이동
+    global game, players
+
     # 남아있는 카운트다운 태스크 정리
     task = game.get("timer_task")
     if task and not task.done():
@@ -384,7 +387,7 @@ async def end_game():
     game["deadline_ts"] = None
     
     # 게임 상태 초기화
-    global game, players
+    # global game, players # <- [수정] 이 줄을 함수 맨 위로 옮겼습니다.
     players = {}
     game = {
         "deck": [], "community": [], "pot": 0, "round": None,
