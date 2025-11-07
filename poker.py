@@ -14,11 +14,7 @@ from datetime import datetime, timedelta
 logging.basicConfig(level=logging.INFO)
 
 # ====== 인텐트 최소 권한 권장 ======
-# 슬래시 커맨드만 사용하므로 기본 인텐트로 충분합니다.
 intents = discord.Intents.default()
-# intents.message_content = True  # <- 슬래시 커맨드만 사용하면 필요 X
-# intents.members = True          # <- 현재 코드에서 멤버 목록 조회가 필요 X
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ====== 봇 준비 이벤트 ======
@@ -26,51 +22,41 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     logging.info(f"Logged in as {bot.user}")
 
-# 슬래시 명령(app_commands) 사용 시, 시작할 때 동기화해 두면 편해요
 @bot.event
 async def setup_hook():
     try:
-        # DB 스키마 준비
         await init_db()
-
-        # 슬래시 명령 동기화 (이 파일에 정의된 명령들이 등록됨)
         synced = await bot.tree.sync()
         logging.info("Slash commands synced: %s", [c.name for c in synced])
-
     except Exception as e:
         logging.exception("setup_hook failed: %s", e)
 
 # ====== 카드 이미지 경로/크기 ======
-CARDS_DIR = os.getenv("CARDS_DIR", "./cards")  # 레포에 cards 폴더를 넣어 배포
- # 예: As.png, 10h.png ...
-CARD_W, CARD_H = 67, 92        # 원본
-SCALE = 0.9                    # 1/4로 축소 전송
+CARDS_DIR = os.getenv("CARDS_DIR", "./cards")
+CARD_W, CARD_H = 67, 92
+SCALE = 0.9
 GAP = 6
 
 # ====== 게임 캐시 ======
-# players: {uid: {name, coins, bet, contrib, cards, folded, all_in}}
+# players: {uid: {name, coins, bet, contrib, cards, folded, all_in, afk_kicked}}
 players = {}
 game = {
     "deck": [],
     "community": [],
     "pot": 0,
-    "round": None,       # "preflop"|"flop"|"turn"|"river"
+    "round": None,
     "turn_order": [],
-    "idx": 0,            # 현재 턴 인덱스
-    "current_bet": 0,    # 이번 스트리트 기준 베팅
-    "acted": set(),      # 이번 스트리트에서 최소 1회 행동한 uid
+    "idx": 0,
+    "current_bet": 0,
+    "acted": set(),
     "game_started": False,
     "last_prompt_msg_id": None,
     "channel_id": None,
-
-    # 블라인드/딜러
-    "dealer_pos": -1,    # 딜러 버튼(턴오더 인덱스). 매 게임마다 회전
-    "sb": 10,            # 스몰블라인드
-    "bb": 20,            # 빅블라인드
-
-    # 타이머
-    "timer_task": None,    # 카운트다운 업데이트 태스크
-    "deadline_ts": None,   # 이 턴 마감(UTC) 유닉스초
+    "dealer_pos": -1,
+    "sb": 10,
+    "bb": 20,
+    "timer_task": None,
+    "deadline_ts": None,
 }
 
 # ====== DB 초기화 ======
@@ -86,12 +72,12 @@ async def init_db():
                 all_in INTEGER DEFAULT 0
             )
         ''')
-        
-        # [수정] 봇 재시작/크래시 시, DB에 갇힌 유저 상태 초기화
-        await db.execute('''
-            UPDATE character SET in_game = 0, bet = 0, all_in = 0 WHERE in_game = 1
-        ''')
-        
+        # 봇 재시작 시, DB에 갇힌 유저 상태 초기화 (in_game=0으로)
+        # [수정] 자동 참가를 위해 in_game=1인 상태를 유지하도록 이 초기화 로직을 변경합니다.
+        # 대신, /참가 커맨드에서 로컬 캐시(players)와 DB(in_game=1)를 동기화합니다.
+        # await db.execute('''
+        #     UPDATE character SET in_game = 0, bet = 0, all_in = 0 WHERE in_game = 1
+        # ''')
         await db.commit()
 
 # ====== 카드 유틸 ======
@@ -105,14 +91,16 @@ def deal_hole():
     random.shuffle(deck)
     game["deck"] = deck
     for uid in players:
+        # 게임 시작 시 플레이어 상태 초기화
         players[uid]["cards"] = [deck.pop(), deck.pop()]
         players[uid]["bet"] = 0
         players[uid]["contrib"] = 0
         players[uid]["folded"] = False
         players[uid]["all_in"] = False
+        # [수정] AFK 퇴장 플래그 초기화 (게임이 시작되어야 초기화됨)
+        players[uid]["afk_kicked"] = False
 
 def compose(card_codes):
-    """['As','Kd',...] → 가로 합성 PNG (1/4 크기) BytesIO 반환"""
     if not card_codes:
         return None
     try:
@@ -123,12 +111,12 @@ def compose(card_codes):
             path = os.path.join(CARDS_DIR, f"{code}.png")
             if not os.path.exists(path):
                 logging.warning(f"카드 이미지 없음: {path}")
-                img = Image.new("RGBA", (w_scaled, h_scaled), (200, 200, 200, 255))  # 임시 회색
+                img = Image.new("RGBA", (w_scaled, h_scaled), (200, 200, 200, 255))
             else:
                 img = Image.open(path).convert("RGBA").resize((w_scaled, h_scaled), Image.LANCZOS)
             imgs.append(img)
         total_w = w_scaled * len(imgs) + GAP * (len(imgs) - 1)
-        if total_w <= 0: total_w = 1 # 0 너비 방지
+        if total_w <= 0: total_w = 1
         canvas = Image.new("RGBA", (total_w, h_scaled), (0,0,0,0))
         x = 0
         for im in imgs:
@@ -143,9 +131,11 @@ def compose(card_codes):
         return None
 
 def active_players():
+    """폴드/파산(올인 제외)하지 않은 플레이어"""
     return [uid for uid, p in players.items() if not p["folded"] and (p["coins"] > 0 or p["all_in"])]
 
 def can_act(uid):
+    """현재 턴에 행동(체크/콜/레이즈/폴드)이 가능한 플레이어"""
     p = players.get(uid)
     return bool(p) and (not p["folded"]) and (not p["all_in"]) and p["coins"] > 0
 
@@ -161,6 +151,7 @@ def ready_to_advance():
     return True
 
 def next_actor_index(start_from=None):
+    """start_from (포함) 부터 시작해서, 행동 가능한 다음 플레이어의 인덱스를 반환"""
     i = game["idx"] if start_from is None else start_from
     n = len(game["turn_order"])
     if n == 0: return None
@@ -169,26 +160,20 @@ def next_actor_index(start_from=None):
         uid = game["turn_order"][j]
         if can_act(uid):
             return j
-    return None
+    return None # 행동 가능한 플레이어 없음
 
-# ====== 핸드 평가 ======
+# ====== 핸드 평가 (생략) ======
 RANK_ORDER = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13,'A':14}
-
 def parse_card(code):
-    if code.startswith('10'):
-        return '10', code[2]
+    if code.startswith('10'): return '10', code[2]
     return code[0], code[1]
-
 def hand_strength(cards7):
-    if len(cards7) < 5:
-        return (0,)
+    if len(cards7) < 5: return (0,)
     best = None
     for combo in combinations(cards7, 5):
         score = score_5cards(combo)
-        if (best is None) or (score > best):
-            best = score
+        if (best is None) or (score > best): best = score
     return best
-
 def score_5cards(cards5):
     ranks, suits = [], []
     for c in cards5:
@@ -196,50 +181,42 @@ def score_5cards(cards5):
     vals = sorted([RANK_ORDER[r] for r in ranks], reverse=True)
     counts = {v: vals.count(v) for v in set(vals)}
     is_flush = len(set(suits)) == 1
-
     uniq = sorted(set(vals), reverse=True)
     def straight_high(vs):
         if len(vs) < 5: return None
-        # A-5 (마운틴) 엣지 케이스를 먼저 확인
-        if {14, 2, 3, 4, 5}.issubset(set(vs)):
-             return 5
-        # 일반 스트레이트 확인
+        if {14, 2, 3, 4, 5}.issubset(set(vs)): return 5 # A-5 마운틴
         for i in range(len(vs)-4):
             window = vs[i:i+5]
-            if window == list(range(window[0], window[0]-5, -1)):
-                return window[0]
+            if window == list(range(window[0], window[0]-5, -1)): return window[0]
         return None
-    
     sh = straight_high(uniq)
-
-    if is_flush and sh:             return (8, sh)       # 스트레이트 플러시
-    if 4 in counts.values():       # 포카드
+    if is_flush and sh:             return (8, sh)
+    if 4 in counts.values():
         four = max([v for v,c in counts.items() if c==4])
         kicker = max([v for v in vals if v != four])
         return (7, four, kicker)
     trips = sorted([v for v,c in counts.items() if c==3], reverse=True)
     pairs = sorted([v for v,c in counts.items() if c==2], reverse=True)
-    if trips and (pairs or len(trips) >= 2): # 풀하우스
+    if trips and (pairs or len(trips) >= 2):
         t = trips[0]; p = pairs[0] if pairs else trips[1]
         return (6, t, p)
-    if is_flush:                            return (5, *vals)    # 플러시
-    if sh:                                  return (4, sh)       # 스트레이트
-    if trips:                               # 트립스
+    if is_flush:                            return (5, *vals)
+    if sh:                                  return (4, sh)
+    if trips:
         t = trips[0]; kick = sorted([v for v in vals if v!=t], reverse=True)[:2]
         return (3, t, *kick)
-    if len(pairs) >= 2:                     # 투페어
+    if len(pairs) >= 2:
         p1,p2 = pairs[:2]; kicker = max([v for v in vals if v!=p1 and v!=p2])
         return (2, p1, p2, kicker)
-    if len(pairs) == 1:                     # 원페어
+    if len(pairs) == 1:
         p1 = pairs[0]; kick = sorted([v for v in vals if v!=p1], reverse=True)[:3]
         return (1, p1, *kick)
-    return (0, *vals)                       # 하이카드
-
+    return (0, *vals)
 def hand_name(tup):
     names = {8:"스트레이트 플러시",7:"포카드",6:"풀하우스",5:"플러시",4:"스트레이트",3:"트리플",2:"투페어",1:"원페어",0:"하이카드"}
     return names.get(tup[0], "알 수 없음") if tup else "알 수 없음"
 
-# ====== 사이드팟 ======
+# ====== 사이드팟 (생략) ======
 def build_side_pots(contrib_map):
     levels = sorted(set([v for v in contrib_map.values() if v > 0]))
     if not levels: return []
@@ -251,64 +228,49 @@ def build_side_pots(contrib_map):
         pots.append({"cap":cap, "members_all":members_all, "amount":amount, "eligible":eligible})
         prev = cap
     return pots
-
 def split_amount(amount, winners):
     if not winners: return {}
     base = amount // len(winners)
     rem = amount % len(winners)
     dist = {w: base for w in winners}
-    order = sorted(winners)  # uid 오름차순으로 자투리 분배
+    order = sorted(winners)
     for i in range(rem):
         dist[order[i]] += 1
     return dist
 
 # ====== 라운드/턴 진행 ======
 async def disable_prev_prompt(channel: discord.abc.Messageable):
-    """
-    이전 턴 프롬프트와 카운트다운을 정리한다.
-    """
-    # 1) 카운트다운 태스크 정리
     task = game.get("timer_task")
     if task and not task.done():
         try:
             task.cancel()
             await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logging.debug(f"timer_task await error: {e}")
+        except asyncio.CancelledError: pass
+        except Exception as e: logging.debug(f"timer_task await error: {e}")
     game["timer_task"] = None
     game["deadline_ts"] = None
-
-    # 2) 이전 프롬프트 버튼 비활성화
     msg_id = game.get("last_prompt_msg_id")
     if msg_id:
         try:
             msg = await channel.fetch_message(msg_id)
-            try:
-                await msg.edit(view=None)
-            except Exception as e:
-                logging.debug(f"msg.edit(view=None) failed: {e}")
+            await msg.edit(view=None)
         except Exception as e:
-            logging.debug(f"fetch_message({msg_id}) failed: {e}")
-
-    # 3) 상태 초기화
+            logging.debug(f"disable_prev_prompt failed: {e}")
     game["last_prompt_msg_id"] = None
-
 
 async def prompt_action(channel):
     if not game["turn_order"] or game["idx"] >= len(game["turn_order"]):
-        logging.error("잘못된 턴 상태"); return
+        logging.error("잘못된 턴 상태 (prompt_action)"); return
     
-    # 다음 행동할 사람 찾기 (현재 idx 포함)
+    # [수정] 현재 인덱스(game["idx"])부터 행동 가능한 사람을 찾음
     next_idx = next_actor_index(game["idx"])
     if next_idx is None:
-        # 행동할 사람이 아무도 없음 (모두 폴드/올인)
+        # 행동할 플레이어가 아무도 없음 (예: 모두 올인/폴드)
         logging.info("행동할 플레이어 없음, 다음 스트리트로 강제 진행")
         await go_next_street(channel)
         return
 
-    game["idx"] = next_idx # 턴 인덱스 업데이트
+    game["idx"] = next_idx # 실제 턴 인덱스 업데이트
     uid = game["turn_order"][game["idx"]]
     
     alive = [u for u in active_players() if not players[u]["folded"]]
@@ -318,91 +280,126 @@ async def prompt_action(channel):
     p = players[uid]; cur_bet = game["current_bet"]
     need_to_call = max(0, cur_bet - p["bet"])
 
-    # 이전 프롬프트/타이머 정리
     await disable_prev_prompt(channel)
 
-    # 120초 마감 타임스탬프 저장
+    # [수정] 턴이 돌아올 때마다 120초 타이머 리셋
     deadline = datetime.utcnow() + timedelta(seconds=120)
     game["deadline_ts"] = int(deadline.timestamp())
 
-    # 기본 안내문 + 마감 표시
     base_text = (
         f"🎯 **{p['name']}**의 차례!\n"
         f"라운드: **{game['round'] or 'preflop'}** / 팟: **{game['pot']}** / "
         f"콜 필요: **{need_to_call}** / 보유: **{p['coins']}**"
     )
-
-    view = ActionPromptView(actor_id=uid)
+    view = ActionPromptView(actor_id=uid) # 120초 타임아웃 뷰 생성
     msg = await channel.send(
         base_text + f"\n⏳ 마감: <t:{game['deadline_ts']}:R> (<t:{game['deadline_ts']}:T>)",
         view=view
     )
     game["last_prompt_msg_id"] = msg.id
-
-    # 카운트다운 시작 (진행바/남은 초 갱신)
+    # 타이머 갱신 작업 시작
     game["timer_task"] = asyncio.create_task(_run_countdown(msg, base_text, game["deadline_ts"]))
 
-# ← 여긴 들여쓰기 없이 모듈 전역 (O)
 async def advance_or_next_round(channel):
     """
-    모든 유효 플레이어가 이번 스트리트에서 행동을 1번 이상 했고,
-    모두의 bet가 current_bet에 맞춰졌다면 다음 스트리트로,
-    아니면 다음 액터에게 턴을 넘깁니다.
+    행동이 완료되었는지(ready_to_advance) 체크하고,
+    완료 시 -> go_next_street()
+    미완료 시 -> 다음 턴(prompt_action)
     """
     if ready_to_advance() or next_actor_index() is None:
         await go_next_street(channel)
     else:
-        # 다음 턴은 현재 턴 다음 사람부터 찾아야 함
+        # 다음 턴 (현재 턴 + 1)
         next_idx = next_actor_index(game["idx"] + 1)
         if next_idx is not None:
             game["idx"] = next_idx
             await prompt_action(channel)
         else:
             # 다음 사람이 없으면 (예: 현재 턴이 마지막이었음)
-            # ready_to_advance() 조건이 false인 경우 (예: A가 100벳, B가 200벳)
-            # 다시 처음(SB)부터 돌아서 행동해야 함
+            # 하지만 ready_to_advance()가 False (예: A 100벳, B 200벳)
+            # -> 다시 처음(SB)부터 돌아서 행동해야 함
             first_actor_i = (game["dealer_pos"] + 1) % len(game["turn_order"])
             next_idx_from_start = next_actor_index(first_actor_i)
-            if next_idx_from_start is not None and next_idx_from_start != game["idx"]:
+            
+            if next_idx_from_start is not None:
                  game["idx"] = next_idx_from_start
                  await prompt_action(channel)
             else:
-                 # 그래도 없거나, 현재 턴으로 다시 돌아왔다면 스트리트 종료
+                 # 그래도 없으면 (모두 행동했는데 ready_to_advance가 False? -> 오류 상황이거나, 모두 올인/폴드)
                  await go_next_street(channel)
 
-
+# [수정] end_game 함수: 플레이어를 유지하고 상태만 초기화
 async def end_game():
-    # [수정] global 선언을 함수 맨 위로 이동
-    global game, players
+    global game, players # 'players' 딕셔너리를 유지합니다.
 
-    # 남아있는 카운트다운 태스크 정리
+    # 1. 타이머 정리
     task = game.get("timer_task")
     if task and not task.done():
         try:
             task.cancel()
             await task
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError: pass
     game["timer_task"] = None
     game["deadline_ts"] = None
+
+    # 2. 다음 게임에서 제외할 플레이어 확인 (AFK 또는 파산)
+    channel = bot.get_channel(game["channel_id"])
+    if not channel:
+        logging.error("end_game: Channel not found, cannot send messages.")
+
+    uids_to_remove = []
+    uids_to_keep = []
     
-    # 게임 상태 초기화
-    # global game, players # <- [수정] 이 줄을 함수 맨 위로 옮겼습니다.
-    players = {}
+    # .items() 대신 list(players)로 순회 (딕셔너리 변경 중 에러 방지)
+    for uid in list(players.keys()):
+        p = players[uid]
+        if p.get("afk_kicked", False):
+            uids_to_remove.append((uid, "AFK(시간 초과)로 인해 퇴장합니다."))
+        elif p["coins"] <= 0:
+            uids_to_remove.append((uid, "코인을 모두 잃어 퇴장합니다. (파산)"))
+        else:
+            uids_to_keep.append(uid)
+
+    # 3. DB 업데이트 및 로컬 캐시(players) 정리
+    async with aiosqlite.connect("test.db") as db:
+        for uid, reason in uids_to_remove:
+            if channel:
+                # 플레이어 객체가 아직 남아있을 때 메시지 전송
+                if uid in players:
+                    await channel.send(f"🚪 **{players[uid]['name']}**님: {reason}")
+            # DB: in_game=0 (퇴장), 코인 저장
+            await db.execute("UPDATE character SET in_game=0, coin=? WHERE user_id=?", (players[uid]['coins'], uid))
+            players.pop(uid) # 로컬 캐시에서 제거
+        
+        for uid in uids_to_keep:
+            # DB: in_game=1 (유지), 코인 저장
+            await db.execute("UPDATE character SET in_game=1, coin=? WHERE user_id=?", (players[uid]['coins'], uid))
+
+    # 4. 'game' 상태만 초기화 ('players'는 유지)
     game = {
         "deck": [], "community": [], "pot": 0, "round": None,
         "turn_order": [], "idx": 0, "current_bet": 0, "acted": set(),
-        "game_started": False, "last_prompt_msg_id": None, "channel_id": None,
-        "dealer_pos": game.get("dealer_pos", -1), # 딜러 위치는 유지
+        "game_started": False, # <-- 게임 종료 상태
+        "last_prompt_msg_id": None, "channel_id": game.get("channel_id"), # 채널 ID 유지
+        "dealer_pos": game.get("dealer_pos", -1), # 딜러 위치 유지
         "sb": 10, "bb": 20,
         "timer_task": None, "deadline_ts": None,
     }
 
+    # 5. 다음 게임 로비 안내
+    if channel:
+        if players: # 남아있는 플레이어가 있다면
+            names = ", ".join([p['name'] for p in players.values()])
+            await channel.send(
+                f"✅ 게임 종료! 다음 게임을 준비합니다.\n"
+                f"현재 참가자 ({len(players)}명): {names}\n\n"
+                f"`/시작`을 눌러 다음 게임을 시작하세요!\n"
+                f"(새로운 참가자는 `/참가`, 나가시려면 `/퇴장`)"
+            )
+        else:
+            await channel.send("✅ 게임 종료! 모든 플레이어가 퇴장했습니다.")
+
 async def go_next_street(channel):
-    """
-    스트리트 종료 → 팟/기여 정산 → 다음 스트리트 공개(플랍/턴/리버) 후 다음 액터에게 턴,
-    또는 쇼다운 처리
-    """
     # 1) 이번 스트리트 베팅을 팟으로 이동
     for uid, p in players.items():
         game["pot"] += p["bet"]
@@ -411,8 +408,7 @@ async def go_next_street(channel):
     game["current_bet"] = 0
     game["acted"].clear()
 
-    # 2) 다음 공개/라운드 전개
-    current_round = game.get("round", "preflop") # None일 경우 preflop으로 간주
+    current_round = game.get("round", "preflop")
     
     if current_round == "preflop":
         game["round"] = "flop"
@@ -421,13 +417,11 @@ async def go_next_street(channel):
             await channel.send("🔥 **플랍 공개!**")
         else:
             logging.error("덱 카드 부족"); await end_game(); return
-        # 포스트플랍 선행: 딜러 다음
         n = len(game["turn_order"])
         if n > 0:
             first_postflop_i = (game["dealer_pos"] + 1) % n
             maybe = next_actor_index(first_postflop_i)
-            if maybe is not None:
-                game["idx"] = maybe
+            if maybe is not None: game["idx"] = maybe
 
     elif current_round == "flop":
         game["round"] = "turn"
@@ -440,8 +434,7 @@ async def go_next_street(channel):
         if n > 0:
             first_postflop_i = (game["dealer_pos"] + 1) % n
             maybe = next_actor_index(first_postflop_i)
-            if maybe is not None:
-                game["idx"] = maybe
+            if maybe is not None: game["idx"] = maybe
 
     elif current_round == "turn":
         game["round"] = "river"
@@ -454,19 +447,16 @@ async def go_next_street(channel):
         if n > 0:
             first_postflop_i = (game["dealer_pos"] + 1) % n
             maybe = next_actor_index(first_postflop_i)
-            if maybe is not None:
-                game["idx"] = maybe
-
+            if maybe is not None: game["idx"] = maybe
     else: # river
-        # 쇼다운
         await resolve_showdown(channel)
         return
 
-    # 3) 보드 이미지 표시
     buf = compose(game["community"])
     if buf:
         await channel.send(file=discord.File(buf, filename=f"board_{game['round']}.png"))
 
+    # [수정] 문법 오류 수정
     # 4) 다음 액터 프롬프트 (행동 가능한 사람이 2명 이상인지 확인)
     remaining_to_act = [uid for uid in game["turn_order"] if can_act(uid)]
     if len(remaining_to_act) < 2 and game["round"] != "river":
@@ -476,50 +466,54 @@ async def go_next_street(channel):
          await asyncio.sleep(1) # 잠시 대기
          await go_next_street(channel)
     else:
-        # 정상적으로 다음 턴 진행
-        await prompt_action(channel)
+        # 정상적으로 다음 턴 진행 (단, 행동할 사람이 1명이라도 있어야 함)
+        if remaining_to_act:
+            await prompt_action(channel)
+        else:
+            # 행동할 사람이 아무도 없으면 (모두 올인/폴드) 다음 스트리트
+            await go_next_street(channel)
 
 
 async def handle_single_winner(channel, alive):
+    # 1. 팟 정산
     for p in players.values():
         game["pot"] += p["bet"]
         p["contrib"] = p.get("contrib", 0) + p["bet"]
         p["bet"] = 0
+    
+    # 2. 승자에게 팟 지급
     if alive:
-        winner = alive[0]
-        players[winner]["coins"] += game["pot"]
-        async with aiosqlite.connect("test.db") as db:
-            await db.execute("UPDATE character SET coin=?, in_game=0 WHERE user_id=?", (players[winner]["coins"], winner))
-            await db.commit()
-        await channel.send(f"🏆 **{players[winner]['name']}** 단독 승리! 팟 {game['pot']} 코인 획득")
-    else:
-        await channel.send("모두 폴드하여 팟이 증발했습니다...") # 이 경우는 거의 없어야 함
+        winner_uid = alive[0]
+        winner_name = players[winner_uid]["name"]
+        players[winner_uid]["coins"] += game["pot"]
         
-    # DB에 다른 플레이어들 in_game=0 처리
-    async with aiosqlite.connect("test.db") as db:
-        for uid in players:
-             if not alive or uid != alive[0]:
-                 await db.execute("UPDATE character SET in_game=0 WHERE user_id=?", (uid,))
-        await db.commit()
+        await channel.send(f"🏆 **{winner_name}** 단독 승리! 팟 {game['pot']} 코인 획득")
+    else:
+        await channel.send("모두 폴드하여 팟이 증발했습니다...")
 
+    # 3. 게임 종료 처리 (end_game이 DB 업데이트 및 캐시 정리)
     await end_game()
+
 
 # ====== 쇼다운/정산 ======
 async def resolve_showdown(channel):
-    # 마지막 베팅 이동
+    # 1. 마지막 베팅 이동
     for uid, p in players.items():
         game["pot"] += p["bet"]
         p["contrib"] = p.get("contrib", 0) + p["bet"]
         p["bet"] = 0
 
+    # 2. 쇼다운 대상자 확인
     remaining = [uid for uid, p in players.items() if not p["folded"]]
     if len(remaining) <= 1:
         await handle_single_winner(channel, remaining)
         return
 
+    # 3. 사이드팟 빌드
     contrib = {uid: players[uid].get("contrib", 0) for uid in players}
     pots = build_side_pots(contrib)
 
+    # 4. 핸드 평가
     board = game["community"]
     winnings = {uid: 0 for uid in players}
     strength_cache = {}
@@ -531,9 +525,8 @@ async def resolve_showdown(channel):
         buf = compose(board)
         if buf: await channel.send("🃏 **최종 보드:**", file=discord.File(buf, filename="final_board.png"))
 
+    # 5. 핸드 공개
     desc_lines = []
-    # 핸드 공개 순서 정렬 (나중에 베팅한 사람부터, 또는 딜러 왼쪽부터)
-    # 여기서는 간단히 uid 순서로...
     sorted_showdown = sorted(strength_cache.keys(), key=lambda u: players[u]["name"])
 
     for uid in sorted_showdown:
@@ -546,6 +539,7 @@ async def resolve_showdown(channel):
     if desc_lines:
         await channel.send("🎯 **쇼다운 요약:**\n" + "\n".join(desc_lines))
 
+    # 6. 팟 분배
     for i, pot in enumerate(pots, 1):
         amount = pot["amount"]; eligible = pot["eligible"]
         if not eligible or amount <= 0: continue
@@ -557,6 +551,7 @@ async def resolve_showdown(channel):
                 best = st; winners = [uid]
             elif st == best:
                 winners.append(uid)
+        
         dist = split_amount(amount, winners)
         for uid, val in dist.items():
             winnings[uid] += val
@@ -567,7 +562,7 @@ async def resolve_showdown(channel):
         else:
             await channel.send(f"🫙 **{'메인팟' if i == 1 else f'사이드팟 #{i}'}** (총 {amount}) → 승자 없음 (해당 팟에 폴드하지 않은 유저가 없음)")
 
-
+    # 7. 최종 정산
     total_distributed = 0
     result_lines = []
     for uid, p in players.items():
@@ -579,11 +574,7 @@ async def resolve_showdown(channel):
         
     await channel.send(f"💰 **총 {total_distributed} 코인 분배 완료!**\n" + "\n".join(result_lines))
 
-    async with aiosqlite.connect("test.db") as db:
-        for uid, p in players.items():
-            await db.execute("UPDATE character SET coin=?, in_game=0 WHERE user_id=?", (p["coins"], uid))
-        await db.commit()
-
+    # 8. 게임 종료 (end_game이 DB 업데이트 및 캐시 정리)
     await end_game()
 
 # ====== UI ======
@@ -605,7 +596,6 @@ class RaiseModal(discord.ui.Modal, title="레이즈 금액 입력"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            # [수정] self.amount -> self.amount.value 로 변경
             val_str = str(self.amount.value).strip()
             if not val_str:
                  raise ValueError("입력값이 없습니다.")
@@ -703,7 +693,6 @@ class MultiPeekCardsView(discord.ui.View):
                 if interaction.user.id != target_uid:
                     await interaction.response.send_message("이 버튼은 해당 플레이어만 사용할 수 있어요!", ephemeral=True); return
                 
-                # players 딕셔너리가 비어있지 않고, 해당 유저가 존재하는지 확인
                 p = players.get(target_uid)
                 if not p:
                     await interaction.response.send_message("게임이 시작되지 않았거나 참가자가 아닙니다!", ephemeral=True); return
@@ -814,24 +803,25 @@ async def handle_afk_fold(uid: int):
         return
 
     # 2. 현재 턴이 타임아웃된 유저가 맞는지 확인 (중요: 레이스 컨디션 방지)
+    current_turn_uid = game["turn_order"][game["idx"]]
     if (not game["turn_order"] or 
         game["idx"] >= len(game["turn_order"]) or 
-        game["turn_order"][game["idx"]] != uid):
+        current_turn_uid != uid):
         # 타임아웃이 발생했지만, 그 직전에 유저가 행동했거나 턴이 이미 넘어간 경우
-        logging.info(f"AFK: 턴이 이미 {uid}가 아님, 무시")
+        logging.info(f"AFK: 턴이 이미 {uid}가 아님 (현재: {current_turn_uid}), 무시")
         return
 
     # 3. 플레이어 정보 확인
     p = players.get(uid)
     if not p or p["folded"] or p["all_in"]:
-        # 플레이어가 없거나, 이미 폴드/올인 상태면 처리할 필요 없음
         return
 
     # 4. 강제 폴드 처리
     logging.info(f"AFK: {p['name']} ({uid}) 자동 폴드 처리")
     p["folded"] = True
+    p["afk_kicked"] = True # [수정] AFK 플래그 설정 (게임 종료 시 퇴장 처리용)
     game["acted"].add(uid) 
-    await channel.send(f"⏰ **{p['name']}**님의 턴 시간이 초과되어 자동으로 **폴드**합니다.")
+    await channel.send(f"⏰ **{p['name']}**님의 턴 시간이 초과되어 자동으로 **폴드**합니다. (다음 게임에서 제외됩니다)")
     
     # 5. 이전 프롬프트 정리 (중요)
     await disable_prev_prompt(channel)
@@ -861,59 +851,86 @@ async def 등록(inter: discord.Interaction, 이름: str):
 async def 조회(inter: discord.Interaction):
     uid = inter.user.id
     async with aiosqlite.connect("test.db") as db:
-        cur = await db.execute("SELECT name, coin FROM character WHERE user_id=?", (uid,))
+        cur = await db.execute("SELECT name, coin, in_game FROM character WHERE user_id=?", (uid,))
         row = await cur.fetchone()
     if not row:
         await inter.response.send_message("먼저 `/등록`으로 캐릭터를 만들어줘!", ephemeral=True); return
-    name, coin = row
-    status = "게임 참가 중" if uid in players else "대기 중"
+    
+    name, coin, in_game_db = row
+    
+    # 로컬 캐시(players)와 DB(in_game) 상태 동기화
+    status = "알 수 없음"
+    if uid in players:
+        status = "게임 참가 중"
+        if game["game_started"]:
+            status = "게임 플레이 중"
+        else:
+            status = "게임 대기 중"
+    elif in_game_db == 1:
+        status = "참가 중 (DB오류?)" # 이 상태는 /참가 시 정리됨
+    else:
+        status = "대기 중 (미참가)"
+
     embed = discord.Embed(title="🎮 캐릭터 정보", color=0x00ff00)
     embed.add_field(name="이름", value=name, inline=True)
     embed.add_field(name="코인", value=f"{coin:,}개", inline=True)
     embed.add_field(name="상태", value=status, inline=True)
     await inter.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="참가", description="현재 게임에 참가")
+@bot.tree.command(name="참가", description="현재 게임 로비에 참가 (봇 재시작 시 필요할 수 있음)")
 async def 참가(inter: discord.Interaction):
+    global players # players 딕셔너리를 수정
+    
     if game["game_started"]:
         await inter.response.send_message("이미 게임이 시작되었어요! 다음 게임에 합류해줘요.", ephemeral=True); return
     uid = inter.user.id
+    
+    # 1. 이미 로컬 캐시(players)에 있는가? (정상 참가 상태)
     if uid in players:
         await inter.response.send_message("이미 참가 중이에요!", ephemeral=True); return
     
+    # 2. 로컬 캐시(players)에는 없지만, DB에는 있는가? (봇 재시작 복구)
     async with aiosqlite.connect("test.db") as db:
-        # DB에서 in_game 플래그 확인 (다른 봇 인스턴스나 크래시 대비)
         cur_db = await db.execute("SELECT name, coin, in_game FROM character WHERE user_id=?", (uid,))
         row_db = await cur_db.fetchone()
+        
         if not row_db:
             await inter.response.send_message("먼저 `/등록`으로 캐릭터 생성!", ephemeral=True); return
         
         name, coin, in_game_db = row_db
-        
-        if in_game_db == 1:
-             logging.warning(f"{name}({uid})가 DB상 in_game=1이지만, 로컬 캐시(players)에 없어 강제 참가 처리")
-             # DB 상태를 0으로 리셋하고 참가를 허용
-             await db.execute("UPDATE character SET in_game=0 WHERE user_id=?", (uid,))
-             await db.commit()
 
         if coin <= 0:
-            await inter.response.send_message("코인이 0이라 참가 불가!", ephemeral=True); return
+            await inter.response.send_message("코인이 0이라 참가 불가! (파산)", ephemeral=True)
+            # DB 상태도 0으로 클린
+            if in_game_db == 1:
+                 await db.execute("UPDATE character SET in_game=0 WHERE user_id=?", (uid,))
+                 await db.commit()
+            return
         
-        players[uid] = {"name": name, "coins": coin, "bet": 0, "contrib": 0, "cards": [], "folded": False, "all_in": False}
+        # 3. 로컬 캐시에도 없고, DB에도 in_game=0인가? (신규 참가)
+        if in_game_db == 0:
+            players[uid] = {"name": name, "coins": coin, "bet": 0, "contrib": 0, "cards": [], "folded": False, "all_in": False, "afk_kicked": False}
+            await db.execute("UPDATE character SET in_game=1 WHERE user_id=?", (uid,))
+            await db.commit()
+            await inter.response.send_message(f"✅ 참가! 현재 인원 {len(players)}명")
         
-        await db.execute("UPDATE character SET in_game=1 WHERE user_id=?", (uid,))
-        await db.commit()
-        
-    await inter.response.send_message(f"✅ 참가! 현재 인원 {len(players)}명")
+        # 4. 로컬 캐시에는 없는데, DB에는 in_game=1인가? (봇 재시작 복구)
+        elif in_game_db == 1:
+            logging.info(f"봇 재시작 복구: {name}({uid}) 님을 로비에 다시 추가합니다.")
+            players[uid] = {"name": name, "coins": coin, "bet": 0, "contrib": 0, "cards": [], "folded": False, "all_in": False, "afk_kicked": False}
+            # DB는 이미 1이므로 건드릴 필요 없음
+            await inter.response.send_message(f"✅ 봇 재시작 복구 완료! ({name}님 참가 처리)\n현재 인원 {len(players)}명", ephemeral=True)
 
-@bot.tree.command(name="퇴장", description="현재 게임에서 퇴장")
+@bot.tree.command(name="퇴장", description="현재 게임 로비에서 퇴장 (다음 게임부터 미참여)")
 async def 퇴장(inter: discord.Interaction):
     uid = inter.user.id
     if uid not in players:
         await inter.response.send_message("현재 게임에 참가하지 않았어요.", ephemeral=True); return
-    if game["game_started"]:
-        await inter.response.send_message("게임 진행 중에는 퇴장할 수 없어요!", ephemeral=True); return
     
+    if game["game_started"]:
+        await inter.response.send_message("게임 진행 중에는 퇴장할 수 없어요! (AFK 시 자동 퇴장)", ephemeral=True); return
+    
+    # 게임 대기 중일 때만 퇴장 가능
     p = players.pop(uid)
     name = p["name"]; coin = p["coins"]
     
@@ -924,6 +941,8 @@ async def 퇴장(inter: discord.Interaction):
 
 @bot.tree.command(name="시작", description="텍사스 홀덤 게임 시작")
 async def 시작(inter: discord.Interaction):
+    global game # game 딕셔너리 수정
+    
     if game["game_started"]:
         await inter.response.send_message("이미 게임이 진행 중이에요!", ephemeral=True); return
     if len(players) < 2:
@@ -941,7 +960,7 @@ async def 시작(inter: discord.Interaction):
     n = len(game["turn_order"])
     game["dealer_pos"] = (game["dealer_pos"] + 1) % n
 
-    # 홀카드 배분
+    # 홀카드 배분 (및 플레이어 상태 초기화)
     deal_hole()
 
     # 블라인드 게시
@@ -955,13 +974,12 @@ async def 시작(inter: discord.Interaction):
         pay = min(amount, p["coins"])
         p["coins"] -= pay
         p["bet"] += pay
-        # p["contrib"] = p.get("contrib", 0) + pay # 블라인드는 contrib에 바로 넣지 않고, 턴 종료시 bet와 함께 합산
         if p["coins"] == 0: p["all_in"] = True
         return pay
 
     sb_paid = post_blind(sb_uid, game["sb"])
     bb_paid = post_blind(bb_uid, game["bb"])
-    game["current_bet"] = max(bb_paid, sb_paid) # current_bet은 BB 금액(bb_paid)
+    game["current_bet"] = max(bb_paid, sb_paid) # current_bet은 BB 금액
 
     # 프리플랍 선행
     first_to_act_i = (bb_i + 1) % n if n > 2 else sb_i
@@ -981,7 +999,16 @@ async def 시작(inter: discord.Interaction):
     await inter.channel.send("🎴 **내 카드 보기** — 자신의 이름 버튼을 눌러 확인하세요!", view=view)
 
     # 블라인드 안내 + 첫 액터 안내
+    # [수정] 첫 액터를 next_actor_index로 정확히 찾아서 안내
+    real_first_actor_i = next_actor_index(first_to_act_i)
+    if real_first_actor_i is None:
+         await inter.channel.send("오류: 행동할 플레이어가 없습니다. 게임을 종료합니다.")
+         await end_game()
+         return
+
+    game["idx"] = real_first_actor_i # 턴 인덱스 확정
     first_actor_name = players[game['turn_order'][game['idx']]]['name']
+    
     await inter.channel.send(
         f"🪙 블라인드 게시 — SB: **{players[sb_uid]['name']}** {sb_paid}, "
         f"BB: **{players[bb_uid]['name']}** {bb_paid}\n"
@@ -996,8 +1023,8 @@ async def 시작(inter: discord.Interaction):
 async def 내카드(inter: discord.Interaction):
     uid = inter.user.id
     p = players.get(uid)
-    if not p or not p["cards"]:
-        await inter.response.send_message("아직 카드가 없어요!", ephemeral=True); return
+    if not p or not p.get("cards"):
+        await inter.response.send_message("아직 카드가 없어요! (게임이 시작되지 않았거나, 참가자가 아님)", ephemeral=True); return
     
     buf = compose(p["cards"])
     if buf:
@@ -1047,17 +1074,10 @@ async def 상태(inter: discord.Interaction):
         contrib = f" / 총액:{p['contrib']}" if p.get("contrib", 0) > 0 else ""
         lines.append(f"{p['name']}: {status}{bet}{contrib}")
     
-    # 턴 순서에 없지만 players에 있는 경우 (거의 없음)
-    for uid, p in players.items():
-         if uid not in game.get("turn_order", []):
-             status = "폴드" if p["folded"] else ("올인" if p["all_in"] else f"{p['coins']}코인")
-             lines.append(f"{p['name']}: {status} (순서?)" )
-
     embed.add_field(name="플레이어 상태", value="\n".join(lines), inline=False)
     
     if game["community"]:
         embed.add_field(name="보드 카드", value=f"{' '.join(game['community'])}", inline=False)
-        # 이미지도 같이 보내기
         buf = compose(game["community"])
         if buf:
             await inter.response.send_message(embed=embed, file=discord.File(buf, "board_state.png"))
@@ -1069,30 +1089,39 @@ async def 상태(inter: discord.Interaction):
 async def 강제종료(inter: discord.Interaction):
     if not inter.user.guild_permissions.administrator:
         await inter.response.send_message("관리자만 가능!", ephemeral=True); return
-    if not game["game_started"]:
-        await inter.response.send_message("진행 중인 게임이 없어요.", ephemeral=True); return
     
+    # [수정] 게임 대기 중일 때도 로비 초기화 가능
+    if not game["game_started"] and not players:
+         await inter.response.send_message("진행 중인 게임이나 대기 중인 플레이어가 없어요.", ephemeral=True); return
+    
+    channel_id = game.get("channel_id") or inter.channel_id
+    channel = bot.get_channel(channel_id)
+
+    if channel:
+        await disable_prev_prompt(channel) # 이전 프롬프트 정리
+            
+    # DB에 모든 플레이어(players 캐시 기준)를 'in_game=0'으로 설정
     async with aiosqlite.connect("test.db") as db:
         for uid, p in players.items():
-            # 게임 시작 시점의 코인으로 롤백 (p['coins']는 현재 코인)
-            # 또는 현재 코인으로 저장. 여기서는 현재 코인으로 저장
             await db.execute("UPDATE character SET coin=?, in_game=0, bet=0, all_in=0 WHERE user_id=?", (p["coins"], uid))
         await db.commit()
-        
-    await inter.response.send_message(f"🛑 게임 강제 종료 (관리자: {inter.user.name})")
-    
-    channel_id = game.get("channel_id")
-    if channel_id:
-        channel = bot.get_channel(channel_id)
-        if channel:
-            await disable_prev_prompt(channel) # 이전 프롬프트 정리
+
+    # 메모리 초기화 (end_game은 players를 유지하므로, 수동 초기화)
+    global game, players
+    players = {}
+    game = {
+        "deck": [], "community": [], "pot": 0, "round": None,
+        "turn_order": [], "idx": 0, "current_bet": 0, "acted": set(),
+        "game_started": False, "last_prompt_msg_id": None, "channel_id": channel_id,
+        "dealer_pos": -1, "sb": 10, "bb": 20,
+        "timer_task": None, "deadline_ts": None,
+    }
             
-    await end_game() # 메모리 초기화
+    await inter.response.send_message(f"🛑 게임 강제 종료 및 로비 초기화 (관리자: {inter.user.name})")
 
 
 def _progress_bar(seconds_left: int, total: int = 120, width: int = 12) -> str:
     seconds_left = max(0, min(total, seconds_left))
-    # 남은 시간 기준이 아닌, 경과 시간 기준으로
     elapsed = total - seconds_left
     filled = int(round(elapsed / total * width))
     return "█" * filled + "░" * (width - filled)
@@ -1104,15 +1133,6 @@ async def _run_countdown(msg: discord.Message, base_text: str, deadline_ts: int)
             now = int(datetime.utcnow().timestamp())
             left = max(0, deadline_ts - now)
             
-            # 메시지가 삭제되었거나, 뷰가 이미 타임아웃/종료되었는지 확인
-            try:
-                # fetch_message는 API 콜이라 비쌈
-                # 대신, 수정 시 에러 캐치로 대체
-                pass
-            except discord.NotFound:
-                 logging.debug("카운트다운 메시지 못 찾음, 중지")
-                 return
-                 
             # 턴이 이미 넘어갔는지 (deadline_ts가 바뀌었는지)
             if game.get("deadline_ts") != deadline_ts:
                  logging.debug("카운트다운: 턴이 이미 넘어감, 중지")
@@ -1147,12 +1167,11 @@ if __name__ == "__main__":
     token = os.getenv("TOKEN")
     if not token:
         try:
-            # 로컬 개발에서 .env를 쓴다면 주석 해제 후 사용 가능
             from dotenv import load_dotenv
             load_dotenv()
             token = os.getenv("TOKEN")
         except ImportError:
-            pass # dotenv 없으면 무시
+            pass
             
         if not token:
             raise RuntimeError(
