@@ -712,7 +712,7 @@ class MultiPeekCardsView(discord.ui.View):
                 buf = compose(cards)
                 if buf:
                     await interaction.response.send_message(
-                        "🎴 당신의 핸드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True
+                        "🎴 당신의 홀카드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True
                     )
                 else:
                     await interaction.response.send_message("카드 이미지를 생성할 수 없습니다.", ephemeral=True)
@@ -931,4 +931,229 @@ async def 시작(inter: discord.Interaction):
     game.update({
         "deck": [], "community": [], "pot": 0, "round": "preflop",
         "turn_order": list(players.keys()), "idx": 0,
-        "current_bet
+        "current_bet": 0, "acted": set(), "game_started": True,
+        "last_prompt_msg_id": None, "channel_id": inter.channel_id
+    })
+    # 딜러 버튼 회전
+    n = len(game["turn_order"])
+    game["dealer_pos"] = (game["dealer_pos"] + 1) % n
+
+    # 홀카드 배분
+    deal_hole()
+
+    # 블라인드 게시
+    dealer_i = game["dealer_pos"]
+    sb_i = (dealer_i + 1) % n if n > 2 else dealer_i
+    bb_i = (sb_i + 1) % n if n > 2 else (dealer_i + 1) % n
+    sb_uid = game["turn_order"][sb_i]; bb_uid = game["turn_order"][bb_i]
+
+    def post_blind(uid: int, amount: int):
+        p = players[uid]
+        pay = min(amount, p["coins"])
+        p["coins"] -= pay
+        p["bet"] += pay
+        # p["contrib"] = p.get("contrib", 0) + pay # 블라인드는 contrib에 바로 넣지 않고, 턴 종료시 bet와 함께 합산
+        if p["coins"] == 0: p["all_in"] = True
+        return pay
+
+    sb_paid = post_blind(sb_uid, game["sb"])
+    bb_paid = post_blind(bb_uid, game["bb"])
+    game["current_bet"] = max(bb_paid, sb_paid) # current_bet은 BB 금액(bb_paid)
+
+    # 프리플랍 선행
+    first_to_act_i = (bb_i + 1) % n if n > 2 else sb_i
+    game["idx"] = first_to_act_i # next_actor_index는 prompt_action에서 처리
+
+    # 시작 임베드
+    embed = discord.Embed(title="🃏 텍사스 홀덤 시작!", color=0x0099ff)
+    embed.add_field(name="참가자", value=", ".join([p["name"] for p in players.values()]), inline=False)
+    embed.add_field(name="블라인드", value=f"SB {game['sb']}, BB {game['bb']}", inline=True)
+    embed.add_field(name="딜러", value=players[game["turn_order"][game["dealer_pos"]]]["name"], inline=True)
+    embed.add_field(name="라운드", value="프리플랍", inline=True)
+    await inter.response.send_message(embed=embed)
+
+    # “내 카드 보기” — 모든 플레이어 이름 버튼을 한 메시지에 가로로
+    uid_name_pairs = [(uid, p["name"]) for uid, p in players.items()]
+    view = MultiPeekCardsView(uid_name_pairs)
+    await inter.channel.send("🎴 **내 카드 보기** — 자신의 이름 버튼을 눌러 확인하세요!", view=view)
+
+    # 블라인드 안내 + 첫 액터 안내
+    first_actor_name = players[game['turn_order'][game['idx']]]['name']
+    await inter.channel.send(
+        f"🪙 블라인드 게시 — SB: **{players[sb_uid]['name']}** {sb_paid}, "
+        f"BB: **{players[bb_uid]['name']}** {bb_paid}\n"
+        f"🎯 프리플랍 선행: **{first_actor_name}**"
+    )
+
+    # 첫 턴 시작
+    await asyncio.sleep(1)
+    await prompt_action(inter.channel)
+
+@bot.tree.command(name="내카드", description="내 홀카드 보기 (나만)")
+async def 내카드(inter: discord.Interaction):
+    uid = inter.user.id
+    p = players.get(uid)
+    if not p or not p["cards"]:
+        await inter.response.send_message("아직 카드가 없어요!", ephemeral=True); return
+    
+    buf = compose(p["cards"])
+    if buf:
+        await inter.response.send_message("🎴 당신의 홀카드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True)
+    else:
+        await inter.response.send_message("카드 이미지를 생성할 수 없습니다.", ephemeral=True)
+
+@bot.tree.command(name="상태", description="현재 게임 상태 확인")
+async def 상태(inter: discord.Interaction):
+    if not game["game_started"]:
+        if players:
+            embed = discord.Embed(title="🎰 게임 대기 중", color=0xffaa00)
+            embed.add_field(name="참가자 수", value=f"{len(players)}명", inline=True)
+            embed.add_field(name="참가자", value=", ".join([p["name"] for p in players.values()]), inline=False)
+            embed.add_field(name="게임 시작", value="2명 이상일 때 `/시작`", inline=False)
+        else:
+            embed = discord.Embed(title="🎰 참가자 없음", color=0x666666)
+            embed.description = "`/참가` 명령어로 게임에 참가하세요!"
+        await inter.response.send_message(embed=embed); return
+
+    embed = discord.Embed(title="🃏 게임 진행 중", color=0x00ff00)
+    embed.add_field(name="라운드", value=game.get("round", "preflop"), inline=True)
+    embed.add_field(name="현재 팟", value=f"{game['pot']} 코인", inline=True)
+    embed.add_field(name="현재 베팅", value=f"{game['current_bet']} 코인", inline=True)
+    try:
+        dealer_name = players[game["turn_order"][game["dealer_pos"]]]["name"]
+        embed.add_field(name="딜러", value=dealer_name, inline=True)
+        embed.add_field(name="블라인드", value=f"SB {game['sb']}, BB {game['bb']}", inline=True)
+    except Exception:
+        pass
+    
+    if game["idx"] < len(game["turn_order"]):
+        try:
+             actor_name = players[game["turn_order"][game["idx"]]]["name"]
+             embed.add_field(name="현재 턴", value=actor_name, inline=True)
+        except (KeyError, IndexError):
+             embed.add_field(name="현재 턴", value="알 수 없음", inline=True)
+
+
+    lines = []
+    for uid in game.get("turn_order", []): # 턴 순서대로 표시
+        p = players.get(uid)
+        if not p: continue
+        
+        status = "폴드" if p["folded"] else ("올인" if p["all_in"] else f"{p['coins']}코인")
+        bet = f" / 베팅:{p['bet']}" if p["bet"] > 0 else ""
+        contrib = f" / 총액:{p['contrib']}" if p.get("contrib", 0) > 0 else ""
+        lines.append(f"{p['name']}: {status}{bet}{contrib}")
+    
+    # 턴 순서에 없지만 players에 있는 경우 (거의 없음)
+    for uid, p in players.items():
+         if uid not in game.get("turn_order", []):
+             status = "폴드" if p["folded"] else ("올인" if p["all_in"] else f"{p['coins']}코인")
+             lines.append(f"{p['name']}: {status} (순서?)" )
+
+    embed.add_field(name="플레이어 상태", value="\n".join(lines), inline=False)
+    
+    if game["community"]:
+        embed.add_field(name="보드 카드", value=f"{' '.join(game['community'])}", inline=False)
+        # 이미지도 같이 보내기
+        buf = compose(game["community"])
+        if buf:
+            await inter.response.send_message(embed=embed, file=discord.File(buf, "board_state.png"))
+            return
+
+    await inter.response.send_message(embed=embed)
+
+@bot.tree.command(name="강제종료", description="게임 강제 종료 (관리자)")
+async def 강제종료(inter: discord.Interaction):
+    if not inter.user.guild_permissions.administrator:
+        await inter.response.send_message("관리자만 가능!", ephemeral=True); return
+    if not game["game_started"]:
+        await inter.response.send_message("진행 중인 게임이 없어요.", ephemeral=True); return
+    
+    async with aiosqlite.connect("test.db") as db:
+        for uid, p in players.items():
+            # 게임 시작 시점의 코인으로 롤백 (p['coins']는 현재 코인)
+            # 또는 현재 코인으로 저장. 여기서는 현재 코인으로 저장
+            await db.execute("UPDATE character SET coin=?, in_game=0, bet=0, all_in=0 WHERE user_id=?", (p["coins"], uid))
+        await db.commit()
+        
+    await inter.response.send_message(f"🛑 게임 강제 종료 (관리자: {inter.user.name})")
+    
+    channel_id = game.get("channel_id")
+    if channel_id:
+        channel = bot.get_channel(channel_id)
+        if channel:
+            await disable_prev_prompt(channel) # 이전 프롬프트 정리
+            
+    await end_game() # 메모리 초기화
+
+
+def _progress_bar(seconds_left: int, total: int = 120, width: int = 12) -> str:
+    seconds_left = max(0, min(total, seconds_left))
+    # 남은 시간 기준이 아닌, 경과 시간 기준으로
+    elapsed = total - seconds_left
+    filled = int(round(elapsed / total * width))
+    return "█" * filled + "░" * (width - filled)
+
+async def _run_countdown(msg: discord.Message, base_text: str, deadline_ts: int):
+    try:
+        while True:
+            await asyncio.sleep(5)  # 5초 간격 갱신
+            now = int(datetime.utcnow().timestamp())
+            left = max(0, deadline_ts - now)
+            
+            # 메시지가 삭제되었거나, 뷰가 이미 타임아웃/종료되었는지 확인
+            try:
+                # fetch_message는 API 콜이라 비쌈
+                # 대신, 수정 시 에러 캐치로 대체
+                pass
+            except discord.NotFound:
+                 logging.debug("카운트다운 메시지 못 찾음, 중지")
+                 return
+                 
+            # 턴이 이미 넘어갔는지 (deadline_ts가 바뀌었는지)
+            if game.get("deadline_ts") != deadline_ts:
+                 logging.debug("카운트다운: 턴이 이미 넘어감, 중지")
+                 return
+
+            bar = _progress_bar(left, 120) # 120초 기준
+            extra = f"\n⏳ 마감: <t:{deadline_ts}:R> (<t:{deadline_ts}:T>)\n`[{bar}] {left}s`"
+            
+            try:
+                await msg.edit(content=base_text + extra)
+            except discord.NotFound:
+                 logging.debug("카운트다운 편집 실패 (메시지 삭제됨), 중지")
+                 return
+            except Exception as e:
+                logging.debug(f"카운트다운 편집 실패: {e}")
+                return # 편집 실패 시 루프 중단
+                
+            if left == 0:
+                logging.debug("카운트다운 0초 도달, 종료")
+                return
+            
+    except asyncio.CancelledError:
+        logging.debug("카운트다운 작업 취소됨")
+        pass
+    except Exception as e:
+        logging.exception(f"카운트다운 루프 에러: {e}")
+
+
+
+# ====== 실행부: 환경변수에서 토큰 읽기 ======
+if __name__ == "__main__":
+    token = os.getenv("TOKEN")
+    if not token:
+        try:
+            # 로컬 개발에서 .env를 쓴다면 주석 해제 후 사용 가능
+            from dotenv import load_dotenv
+            load_dotenv()
+            token = os.getenv("TOKEN")
+        except ImportError:
+            pass # dotenv 없으면 무시
+            
+        if not token:
+            raise RuntimeError(
+                "환경변수 TOKEN이 없습니다 — 로컬에선 .env 파일에 TOKEN=... 를 추가하거나, "
+                "배포 환경(Railway 등)의 Variables에 TOKEN을 추가해 주세요"
+            )
+    bot.run(token)
