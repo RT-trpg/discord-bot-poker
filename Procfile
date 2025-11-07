@@ -1,0 +1,1 @@
+worker: python poker.py
