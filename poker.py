@@ -72,12 +72,7 @@ async def init_db():
                 all_in INTEGER DEFAULT 0
             )
         ''')
-        # 봇 재시작 시, DB에 갇힌 유저 상태 초기화 (in_game=0으로)
-        # [수정] 자동 참가를 위해 in_game=1인 상태를 유지하도록 이 초기화 로직을 변경합니다.
-        # 대신, /참가 커맨드에서 로컬 캐시(players)와 DB(in_game=1)를 동기화합니다.
-        # await db.execute('''
-        #     UPDATE character SET in_game = 0, bet = 0, all_in = 0 WHERE in_game = 1
-        # ''')
+        # 자동 참가를 위해 봇 재시작 시 DB를 초기화하지 않음
         await db.commit()
 
 # ====== 카드 유틸 ======
@@ -273,6 +268,7 @@ async def prompt_action(channel):
     game["idx"] = next_idx # 실제 턴 인덱스 업데이트
     uid = game["turn_order"][game["idx"]]
     
+    # [버그 수정] 이 로직이 120초 타이머가 시작되는 것을 막아줌
     alive = [u for u in active_players() if not players[u]["folded"]]
     if len(alive) <= 1:
         await handle_single_winner(channel, alive); return
@@ -282,7 +278,7 @@ async def prompt_action(channel):
 
     await disable_prev_prompt(channel)
 
-    # [수정] 턴이 돌아올 때마다 120초 타이머 리셋
+    # 턴이 돌아올 때마다 120초 타이머 리셋
     deadline = datetime.utcnow() + timedelta(seconds=120)
     game["deadline_ts"] = int(deadline.timestamp())
 
@@ -306,6 +302,12 @@ async def advance_or_next_round(channel):
     완료 시 -> go_next_street()
     미완료 시 -> 다음 턴(prompt_action)
     """
+    
+    # [버그 수정] advance_or_next_round가 호출되기 직전에 이미 승자가 결정됐는지 확인
+    alive = [u for u in active_players() if not players[u]["folded"]]
+    if len(alive) <= 1:
+        await handle_single_winner(channel, alive); return
+
     if ready_to_advance() or next_actor_index() is None:
         await go_next_street(channel)
     else:
@@ -328,7 +330,7 @@ async def advance_or_next_round(channel):
                  # 그래도 없으면 (모두 행동했는데 ready_to_advance가 False? -> 오류 상황이거나, 모두 올인/폴드)
                  await go_next_street(channel)
 
-# [수정] end_game 함수: 플레이어를 유지하고 상태만 초기화
+# end_game 함수: 플레이어를 유지하고 상태만 초기화
 async def end_game():
     global game, players # 'players' 딕셔너리를 유지합니다.
 
@@ -460,7 +462,6 @@ async def go_next_street(channel):
     if buf:
         await channel.send(file=discord.File(buf, filename=f"board_{game['round']}.png"))
 
-    # [수정] 문법 오류 수정
     # 4) 다음 액터 프롬프트 (행동 가능한 사람이 2명 이상인지 확인)
     remaining_to_act = [uid for uid in game["turn_order"] if can_act(uid)]
     if len(remaining_to_act) < 2 and game["round"] != "river":
@@ -477,7 +478,8 @@ async def go_next_street(channel):
             # 행동할 사람이 아무도 없으면 (모두 올인/폴드) 다음 스트리트
             await go_next_street(channel)
 
-# [수정] 단독 승리 시 핸드 공개 로직 추가
+
+# [수정] 단독 승리 시 핸드 공개/래빗 헌팅 로직 추가
 async def handle_single_winner(channel, alive):
     # 1. 팟 정산
     for p in players.values():
@@ -503,14 +505,14 @@ async def handle_single_winner(channel, alive):
         
     winner_name = p["name"]
     
-    view = ShowHandOnWinView(winner_uid=winner_uid, winner_name=winner_name, pot=current_pot)
+    # [수정] WinnerOptionsView (래빗 헌팅 포함)
+    view = WinnerOptionsView(winner_uid=winner_uid, winner_name=winner_name, pot=current_pot)
     await channel.send(
-        f"🏆 **{winner_name}** 단독 승리! 핸드를 공개하시겠습니까? (10초)",
+        f"🏆 **{winner_name}** 단독 승리! 래빗 헌팅 또는 핸드 공개를 선택하세요. (10초)",
         view=view
     )
     
-    # [중요] 팟 지급 및 end_game() 호출은 ShowHandOnWinView의 콜백/타임아웃으로 이동됨
-    # (기존 팟 지급, DB 업데이트, end_game() 호출 로직 삭제)
+    # [중요] 팟 지급 및 end_game() 호출은 WinnerOptionsView의 콜백/타임아웃으로 이동됨
 
 
 # ====== 쇼다운/정산 ======
@@ -597,8 +599,8 @@ async def resolve_showdown(channel):
 
 # ====== UI ======
 
-# [추가] 단독 승리 시 10초간 핸드 공개 여부를 묻는 공개 뷰
-class ShowHandOnWinView(discord.ui.View):
+# [추가] 단독 승리 시 10초간 옵션(공개/숨기기/래빗)을 묻는 공개 뷰
+class WinnerOptionsView(discord.ui.View):
     def __init__(self, winner_uid: int, winner_name: str, pot: int):
         super().__init__(timeout=10.0)
         self.winner_uid = winner_uid
@@ -615,69 +617,93 @@ class ShowHandOnWinView(discord.ui.View):
             return False
         return True
 
-    async def _finish_and_end_game(self, interaction: discord.Interaction, show: bool):
+    async def _finish_game(self, interaction: discord.Interaction, show_hand: bool = False, rabbit_hunt: bool = False):
         if self.already_acted:
-            await interaction.response.defer()
+            await interaction.response.defer() # 이미 처리 중이면 무시
             return
         self.already_acted = True
         
-        # 1. 메시지 수정 (버튼 제거)
-        await interaction.response.edit_message(view=None)
-
         p = players.get(self.winner_uid)
         if not p:
-             logging.error(f"ShowHandOnWinView: 승리자 {self.winner_uid} 정보를 찾을 수 없음")
+             logging.error(f"WinnerOptionsView: 승리자 {self.winner_uid} 정보를 찾을 수 없음")
+             await interaction.response.edit_message(content="오류: 승리자 정보를 찾을 수 없습니다.", view=None)
              await end_game() # 그냥 게임 종료
              return
 
-        # 2. 핸드 공개 (선택 시)
-        if show:
+        # 1. 래빗 헌팅 처리
+        if rabbit_hunt:
+            await interaction.response.edit_message(content=f"🐇 **{self.winner_name}**님이 래빗 헌팅을 선택!", view=None)
+            
+            # 덱에서 남은 카드 팝
+            needed = 5 - len(game["community"])
+            if needed > 0 and len(game["deck"]) >= needed:
+                game["community"].extend([game["deck"].pop() for _ in range(needed)])
+            
+            # 보드 공개
+            board_buf = compose(game["community"])
+            if board_buf:
+                await interaction.channel.send("🃏 **전체 보드 (래빗 헌팅):**", file=discord.File(board_buf, "rabbit_board.png"))
+            
+            # 핸드도 즉시 공개
+            hand_buf = compose(p.get("cards", []))
+            if hand_buf:
+                await interaction.channel.send(f"🎴 **{p['name']}**님의 핸드:", file=discord.File(hand_buf, "shown_hand.png"))
+
+        # 2. 핸드 공개 처리 (래빗 헌팅 안 했을 때)
+        elif show_hand:
+            await interaction.response.edit_message(content=f"🏆 **{self.winner_name}** (승리)", view=None)
             cards = p.get("cards", [])
             buf = compose(cards)
             if buf:
                 await interaction.channel.send(f"🎴 **{p['name']}**님이 승리 핸드를 공개합니다:", file=discord.File(buf, "shown_hand.png"))
-            else:
-                await interaction.channel.send(f"🎴 **{p['name']}**님이 핸드를 공개하려 했으나 이미지 생성에 실패했습니다.")
+        
+        # 3. 숨기기 처리
+        else: # (show_hand=False and rabbit_hunt=False)
+            await interaction.response.edit_message(content=f"🏆 **{self.winner_name}** (승리)", view=None)
 
-        # 3. 팟 지급 및 게임 종료 (원래 handle_single_winner의 나머지 로직)
+        # 4. 팟 지급 및 게임 종료
         p["coins"] += self.pot
         await interaction.channel.send(f"💰 **{self.winner_name}**님이 팟 {self.pot} 코인을 획득했습니다!")
         
-        # 4. 게임 종료 (DB 업데이트, 캐시 정리 등)
         await end_game()
 
-    @discord.ui.button(label="핸드 공개", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="핸드 공개", style=discord.ButtonStyle.success, row=0)
     async def _show(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._finish_and_end_game(interaction, show=True)
+        await self._finish_game(interaction, show_hand=True, rabbit_hunt=False)
 
-    @discord.ui.button(label="숨기기", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="숨기기", style=discord.ButtonStyle.danger, row=0)
     async def _hide(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._finish_and_end_game(interaction, show=False)
+        await self._finish_game(interaction, show_hand=False, rabbit_hunt=False)
+        
+    @discord.ui.button(label="래빗 헌팅 (보드/핸드 모두 공개)", style=discord.ButtonStyle.primary, row=1)
+    async def _rabbit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish_game(interaction, show_hand=True, rabbit_hunt=True)
 
     async def on_timeout(self):
         if self.already_acted:
             return
         self.already_acted = True
-        logging.info(f"ShowHandOnWinView timed out for {self.winner_uid}")
+        logging.info(f"WinnerOptionsView timed out for {self.winner_uid}")
         
         channel = bot.get_channel(game["channel_id"])
         if not channel:
-            logging.error("ShowHandOnWinView timeout: 채널을 찾을 수 없음")
+            logging.error("WinnerOptionsView timeout: 채널을 찾을 수 없음")
+            await end_game()
             return
 
         p = players.get(self.winner_uid)
         if not p:
-             logging.error(f"ShowHandOnWinView timeout: 승리자 {self.winner_uid} 정보를 찾을 수 없음")
+             logging.error(f"WinnerOptionsView timeout: 승리자 {self.winner_uid} 정보를 찾을 수 없음")
              await end_game()
              return
 
+        # 타임아웃 = 숨기기
         p["coins"] += self.pot
         await channel.send(f"💰 (시간 초과) **{self.winner_name}**님이 팟 {self.pot} 코인을 획득했습니다!")
         
-        # 게임 종료
         await end_game()
 
-# [추가] 폴드 시 10초간 핸드 공개 여부를 묻는 에페메럴 뷰
+# 폴드 시 10초간 핸드 공개 여부를 묻는 에페메럴 뷰
 class ShowHandOnFoldView(discord.ui.View):
     def __init__(self, actor_id: int, channel: discord.abc.Messageable):
         super().__init__(timeout=10.0)
@@ -783,6 +809,10 @@ class ActionPromptView(discord.ui.View):
         if not game["game_started"]:
             await interaction.response.send_message("게임이 시작되지 않았어요!", ephemeral=True); return False
         
+        # [버그 수정] game["idx"]가 턴 순서를 벗어났는지 먼저 확인
+        if game["idx"] >= len(game["turn_order"]):
+             await interaction.response.send_message("턴 정보가 잘못되었습니다.", ephemeral=True); return False
+             
         current_actor = game["turn_order"][game["idx"]]
         if current_actor != self.actor_id:
             await interaction.response.send_message(f"이미 턴이 지나갔어요! (현재: {players.get(current_actor, {}).get('name', '알수없음')})", ephemeral=True); return False
@@ -872,7 +902,7 @@ class MultiPeekCardsView(discord.ui.View):
                 buf = compose(cards)
                 if buf:
                     await interaction.response.send_message(
-                        "🎴 당신의 홀카드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True
+                        "🎴 당신의 핸드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True
                     )
                 else:
                     await interaction.response.send_message("카드 이미지를 생성할 수 없습니다.", ephemeral=True)
@@ -948,6 +978,7 @@ async def handle_raise(inter: discord.Interaction, uid: int, raise_amt: int):
     # 다음 턴으로
     await advance_or_next_round(inter.channel)
 
+
 # [수정] 폴드 시 핸드 공개 로직 추가
 async def handle_fold(inter: discord.Interaction, uid: int):
     p = players.get(uid)
@@ -982,10 +1013,13 @@ async def handle_afk_fold(uid: int):
         return
 
     # 2. 현재 턴이 타임아웃된 유저가 맞는지 확인 (중요: 레이스 컨디션 방지)
+    # [버그 수정] game["idx"]가 턴 순서를 벗어났는지 먼저 확인
+    if not game["turn_order"] or game["idx"] >= len(game["turn_order"]):
+        logging.info(f"AFK: 턴 정보가 이미 없음, 무시")
+        return
+        
     current_turn_uid = game["turn_order"][game["idx"]]
-    if (not game["turn_order"] or 
-        game["idx"] >= len(game["turn_order"]) or 
-        current_turn_uid != uid):
+    if current_turn_uid != uid:
         # 타임아웃이 발생했지만, 그 직전에 유저가 행동했거나 턴이 이미 넘어간 경우
         logging.info(f"AFK: 턴이 이미 {uid}가 아님 (현재: {current_turn_uid}), 무시")
         return
@@ -1046,7 +1080,7 @@ async def 조회(inter: discord.Interaction):
         else:
             status = "게임 대기 중"
     elif in_game_db == 1:
-        status = "참가 중 (DB오류?)" # 이 상태는 /참가 시 정리됨
+        status = "참가 중 (봇 재시작됨, /참가 필요)"
     else:
         status = "대기 중 (미참가)"
 
@@ -1056,7 +1090,7 @@ async def 조회(inter: discord.Interaction):
     embed.add_field(name="상태", value=status, inline=True)
     await inter.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="참가", description="현재 게임 로비에 참가 (봇 재시작 시 필요할 수 있음)")
+@bot.tree.command(name="참가", description="현재 게임 로비에 참가")
 async def 참가(inter: discord.Interaction):
     global players # players 딕셔너리를 수정
     
@@ -1091,14 +1125,14 @@ async def 참가(inter: discord.Interaction):
             players[uid] = {"name": name, "coins": coin, "bet": 0, "contrib": 0, "cards": [], "folded": False, "all_in": False, "afk_kicked": False}
             await db.execute("UPDATE character SET in_game=1 WHERE user_id=?", (uid,))
             await db.commit()
-            await inter.response.send_message(f"✅ 참가! 현재 인원 {len(players)}명")
+            await inter.response.send_message(f"✅ **{name}**님이 참가했습니다! (현재 인원 {len(players)}명)")
         
         # 4. 로컬 캐시에는 없는데, DB에는 in_game=1인가? (봇 재시작 복구)
         elif in_game_db == 1:
             logging.info(f"봇 재시작 복구: {name}({uid}) 님을 로비에 다시 추가합니다.")
             players[uid] = {"name": name, "coins": coin, "bet": 0, "contrib": 0, "cards": [], "folded": False, "all_in": False, "afk_kicked": False}
             # DB는 이미 1이므로 건드릴 필요 없음
-            await inter.response.send_message(f"✅ 봇 재시작 복구 완료! ({name}님 참가 처리)\n현재 인원 {len(players)}명", ephemeral=True)
+            await inter.response.send_message(f"✅ 봇 재시작 복구 완료! (**{name}**님 참가 처리)\n현재 인원 {len(players)}명")
 
 @bot.tree.command(name="퇴장", description="현재 게임 로비에서 퇴장 (다음 게임부터 미참여)")
 async def 퇴장(inter: discord.Interaction):
@@ -1116,7 +1150,7 @@ async def 퇴장(inter: discord.Interaction):
     async with aiosqlite.connect("test.db") as db:
         await db.execute("UPDATE character SET in_game=0, coin=? WHERE user_id=?", (coin, uid))
         await db.commit()
-    await inter.response.send_message(f"🚪 {name} 퇴장 완료")
+    await inter.response.send_message(f"🚪 **{name}**님이 퇴장했습니다.")
 
 @bot.tree.command(name="시작", description="텍사스 홀덤 게임 시작")
 async def 시작(inter: discord.Interaction):
@@ -1139,7 +1173,7 @@ async def 시작(inter: discord.Interaction):
     n = len(game["turn_order"])
     game["dealer_pos"] = (game["dealer_pos"] + 1) % n
 
-    # 홀카드 배분 (및 플레이어 상태 초기화)
+    # 핸드 배분 (및 플레이어 상태 초기화)
     deal_hole()
 
     # 블라인드 게시
@@ -1175,14 +1209,20 @@ async def 시작(inter: discord.Interaction):
     # “내 카드 보기” — 모든 플레이어 이름 버튼을 한 메시지에 가로로
     uid_name_pairs = [(uid, p["name"]) for uid, p in players.items()]
     view = MultiPeekCardsView(uid_name_pairs)
-    await inter.channel.send("🎴 **내 카드 보기** — 자신의 이름 버튼을 눌러 확인하세요!", view=view)
+    await inter.channel.send("🎴 **내 핸드 보기** — 자신의 이름 버튼을 눌러 확인하세요!", view=view)
 
     # 블라인드 안내 + 첫 액터 안내
     # [수정] 첫 액터를 next_actor_index로 정확히 찾아서 안내
     real_first_actor_i = next_actor_index(first_to_act_i)
     if real_first_actor_i is None:
-         await inter.channel.send("오류: 행동할 플레이어가 없습니다. 게임을 종료합니다.")
-         await end_game()
+         # (예: SB, BB가 모두 올인)
+         await inter.channel.send(
+            f"🪙 블라인드 게시 — SB: **{players[sb_uid]['name']}** {sb_paid} (올인), "
+            f"BB: **{players[bb_uid]['name']}** {bb_paid} (올인)\n"
+            f"🎯 행동할 플레이어가 없습니다. 즉시 다음 스트리트로 넘어갑니다."
+         )
+         await asyncio.sleep(1)
+         await go_next_street(inter.channel)
          return
 
     game["idx"] = real_first_actor_i # 턴 인덱스 확정
@@ -1198,8 +1238,8 @@ async def 시작(inter: discord.Interaction):
     await asyncio.sleep(1)
     await prompt_action(inter.channel)
 
-@bot.tree.command(name="내카드", description="내 홀카드 보기 (나만)")
-async def 내카드(inter: discord.Interaction):
+@bot.tree.command(name="내핸드", description="내 핸드 보기 (나만)")
+async def 내핸드(inter: discord.Interaction):
     uid = inter.user.id
     p = players.get(uid)
     if not p or not p.get("cards"):
@@ -1207,7 +1247,7 @@ async def 내카드(inter: discord.Interaction):
     
     buf = compose(p["cards"])
     if buf:
-        await inter.response.send_message("🎴 당신의 홀카드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True)
+        await inter.response.send_message("🎴 당신의 핸드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True)
     else:
         await inter.response.send_message("카드 이미지를 생성할 수 없습니다.", ephemeral=True)
 
@@ -1264,15 +1304,13 @@ async def 상태(inter: discord.Interaction):
 
     await inter.response.send_message(embed=embed)
 
-@bot.tree.command(name="강제종료", description="게임 강제 종료 (관리자)")
+@bot.tree.command(name="강제종료", description="게임 강제 종료 및 로비 초기화 (관리자)")
 async def 강제종료(inter: discord.Interaction):
-    # [수정] global 선언을 함수 맨 위로 이동
     global game, players
 
     if not inter.user.guild_permissions.administrator:
         await inter.response.send_message("관리자만 가능!", ephemeral=True); return
     
-    # [수정] 게임 대기 중일 때도 로비 초기화 가능
     if not game["game_started"] and not players:
          await inter.response.send_message("진행 중인 게임이나 대기 중인 플레이어가 없어요.", ephemeral=True); return
     
@@ -1288,8 +1326,7 @@ async def 강제종료(inter: discord.Interaction):
             await db.execute("UPDATE character SET coin=?, in_game=0, bet=0, all_in=0 WHERE user_id=?", (p["coins"], uid))
         await db.commit()
 
-    # 메모리 초기화 (end_game은 players를 유지하므로, 수동 초기화)
-    # global game, players # [수정] 이 줄을 함수 맨 위로 옮겼습니다.
+    # 메모리 초기화
     players = {}
     game = {
         "deck": [], "community": [], "pot": 0, "round": None,
