@@ -703,6 +703,7 @@ class WinnerOptionsView(discord.ui.View):
         
         await end_game()
 
+
 # 폴드 시 10초간 핸드 공개 여부를 묻는 에페메럴 뷰
 class ShowHandOnFoldView(discord.ui.View):
     def __init__(self, actor_id: int, channel: discord.abc.Messageable):
@@ -901,6 +902,7 @@ class MultiPeekCardsView(discord.ui.View):
                 
                 buf = compose(cards)
                 if buf:
+                    # [수정] "홀카드" -> "핸드"
                     await interaction.response.send_message(
                         "🎴 당신의 핸드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True
                     )
@@ -1125,6 +1127,7 @@ async def 참가(inter: discord.Interaction):
             players[uid] = {"name": name, "coins": coin, "bet": 0, "contrib": 0, "cards": [], "folded": False, "all_in": False, "afk_kicked": False}
             await db.execute("UPDATE character SET in_game=1 WHERE user_id=?", (uid,))
             await db.commit()
+            # [수정] 공개 메시지로 변경
             await inter.response.send_message(f"✅ **{name}**님이 참가했습니다! (현재 인원 {len(players)}명)")
         
         # 4. 로컬 캐시에는 없는데, DB에는 in_game=1인가? (봇 재시작 복구)
@@ -1132,6 +1135,7 @@ async def 참가(inter: discord.Interaction):
             logging.info(f"봇 재시작 복구: {name}({uid}) 님을 로비에 다시 추가합니다.")
             players[uid] = {"name": name, "coins": coin, "bet": 0, "contrib": 0, "cards": [], "folded": False, "all_in": False, "afk_kicked": False}
             # DB는 이미 1이므로 건드릴 필요 없음
+            # [수정] 공개 메시지로 변경
             await inter.response.send_message(f"✅ 봇 재시작 복구 완료! (**{name}**님 참가 처리)\n현재 인원 {len(players)}명")
 
 @bot.tree.command(name="퇴장", description="현재 게임 로비에서 퇴장 (다음 게임부터 미참여)")
@@ -1209,6 +1213,7 @@ async def 시작(inter: discord.Interaction):
     # “내 카드 보기” — 모든 플레이어 이름 버튼을 한 메시지에 가로로
     uid_name_pairs = [(uid, p["name"]) for uid, p in players.items()]
     view = MultiPeekCardsView(uid_name_pairs)
+    # [수정] "홀카드" -> "핸드"
     await inter.channel.send("🎴 **내 핸드 보기** — 자신의 이름 버튼을 눌러 확인하세요!", view=view)
 
     # 블라인드 안내 + 첫 액터 안내
@@ -1238,6 +1243,7 @@ async def 시작(inter: discord.Interaction):
     await asyncio.sleep(1)
     await prompt_action(inter.channel)
 
+# [수정] "홀카드" -> "핸드"
 @bot.tree.command(name="내핸드", description="내 핸드 보기 (나만)")
 async def 내핸드(inter: discord.Interaction):
     uid = inter.user.id
@@ -1247,6 +1253,7 @@ async def 내핸드(inter: discord.Interaction):
     
     buf = compose(p["cards"])
     if buf:
+        # [수정] "홀카드" -> "핸드"
         await inter.response.send_message("🎴 당신의 핸드:", file=discord.File(buf, filename="my_cards.png"), ephemeral=True)
     else:
         await inter.response.send_message("카드 이미지를 생성할 수 없습니다.", ephemeral=True)
