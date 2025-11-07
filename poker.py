@@ -53,7 +53,8 @@ if __name__ == "__main__":
 
 
 # ====== 카드 이미지 경로/크기 ======
-CARDS_DIR = r"C:\Users\서나영\Desktop\봇\card"  # 예: As.png, 10h.png ...
+CARDS_DIR = os.getenv("CARDS_DIR", "./cards")  # 레포에 cards 폴더를 넣어 배포
+ # 예: As.png, 10h.png ...
 CARD_W, CARD_H = 67, 92          # 원본
 SCALE = 0.9                      # 1/4로 축소 전송
 GAP = 6
@@ -638,13 +639,6 @@ async def handle_afk_fold(uid: int):
     # 5. 다음 턴으로 진행
     await advance_or_next_round(channel)
 
-# ====== 봇 이벤트 ======
-@bot.event
-async def on_ready():
-    await init_db()
-    await bot.tree.sync()
-    print("✅ 텍사스 홀덤 봇 준비 완료!")
-    print(f"봇 이름: {bot.user} / 서버 수: {len(bot.guilds)}")
 
 # ====== 슬래시 커맨드 ======
 @bot.tree.command(name="등록", description="캐릭터 등록 (1000 코인 시작)")
@@ -842,10 +836,3 @@ async def 강제종료(inter: discord.Interaction):
         await db.commit()
     await end_game()
     await inter.response.send_message("🛑 게임 강제 종료")
-
-# ====== 실행 ======
-if __name__ == "__main__":
-    if not BOT_TOKEN or BOT_TOKEN == "여기에_토큰":
-        print("❌ BOT_TOKEN을 설정해 주세요! (config.py 권장)")
-        raise SystemExit(1)
-    bot.run(BOT_TOKEN)
