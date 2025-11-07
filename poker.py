@@ -369,11 +369,15 @@ async def end_game():
                     await channel.send(f"🚪 **{players[uid]['name']}**님: {reason}")
             # DB: in_game=0 (퇴장), 코인 저장
             await db.execute("UPDATE character SET in_game=0, coin=? WHERE user_id=?", (players[uid]['coins'], uid))
-            players.pop(uid) # 로컬 캐시에서 제거
+            if uid in players:
+                players.pop(uid) # 로컬 캐시에서 제거
         
         for uid in uids_to_keep:
             # DB: in_game=1 (유지), 코인 저장
             await db.execute("UPDATE character SET in_game=1, coin=? WHERE user_id=?", (players[uid]['coins'], uid))
+            # [추가] 로비에 남는 유저의 AFK 플래그를 즉시 초기화
+            if uid in players:
+                players[uid]["afk_kicked"] = False
 
     # 4. 'game' 상태만 초기화 ('players'는 유지)
     game = {
@@ -473,7 +477,7 @@ async def go_next_street(channel):
             # 행동할 사람이 아무도 없으면 (모두 올인/폴드) 다음 스트리트
             await go_next_street(channel)
 
-
+# [수정] 단독 승리 시 핸드 공개 로직 추가
 async def handle_single_winner(channel, alive):
     # 1. 팟 정산
     for p in players.values():
@@ -481,18 +485,32 @@ async def handle_single_winner(channel, alive):
         p["contrib"] = p.get("contrib", 0) + p["bet"]
         p["bet"] = 0
     
-    # 2. 승자에게 팟 지급
-    if alive:
-        winner_uid = alive[0]
-        winner_name = players[winner_uid]["name"]
-        players[winner_uid]["coins"] += game["pot"]
-        
-        await channel.send(f"🏆 **{winner_name}** 단독 승리! 팟 {game['pot']} 코인 획득")
-    else:
-        await channel.send("모두 폴드하여 팟이 증발했습니다...")
+    current_pot = game["pot"]
 
-    # 3. 게임 종료 처리 (end_game이 DB 업데이트 및 캐시 정리)
-    await end_game()
+    # 2. 승자가 없는 경우 (모두 폴드?)
+    if not alive:
+        await channel.send("모두 폴드하여 팟이 증발했습니다...")
+        await end_game() # 게임 종료
+        return
+    
+    # 3. 승자가 있는 경우 (10초 뷰 표시)
+    winner_uid = alive[0]
+    p = players.get(winner_uid)
+    if not p:
+        logging.error(f"handle_single_winner: 승리자 {winner_uid} 정보를 찾을 수 없음")
+        await end_game()
+        return
+        
+    winner_name = p["name"]
+    
+    view = ShowHandOnWinView(winner_uid=winner_uid, winner_name=winner_name, pot=current_pot)
+    await channel.send(
+        f"🏆 **{winner_name}** 단독 승리! 핸드를 공개하시겠습니까? (10초)",
+        view=view
+    )
+    
+    # [중요] 팟 지급 및 end_game() 호출은 ShowHandOnWinView의 콜백/타임아웃으로 이동됨
+    # (기존 팟 지급, DB 업데이트, end_game() 호출 로직 삭제)
 
 
 # ====== 쇼다운/정산 ======
@@ -578,6 +596,146 @@ async def resolve_showdown(channel):
     await end_game()
 
 # ====== UI ======
+
+# [추가] 단독 승리 시 10초간 핸드 공개 여부를 묻는 공개 뷰
+class ShowHandOnWinView(discord.ui.View):
+    def __init__(self, winner_uid: int, winner_name: str, pot: int):
+        super().__init__(timeout=10.0)
+        self.winner_uid = winner_uid
+        self.winner_name = winner_name
+        self.pot = pot
+        self.already_acted = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.winner_uid:
+            await interaction.response.send_message("승리자만 결정할 수 있습니다.", ephemeral=True)
+            return False
+        if self.already_acted:
+            await interaction.response.send_message("이미 결정했습니다.", ephemeral=True)
+            return False
+        return True
+
+    async def _finish_and_end_game(self, interaction: discord.Interaction, show: bool):
+        if self.already_acted:
+            await interaction.response.defer()
+            return
+        self.already_acted = True
+        
+        # 1. 메시지 수정 (버튼 제거)
+        await interaction.response.edit_message(view=None)
+
+        p = players.get(self.winner_uid)
+        if not p:
+             logging.error(f"ShowHandOnWinView: 승리자 {self.winner_uid} 정보를 찾을 수 없음")
+             await end_game() # 그냥 게임 종료
+             return
+
+        # 2. 핸드 공개 (선택 시)
+        if show:
+            cards = p.get("cards", [])
+            buf = compose(cards)
+            if buf:
+                await interaction.channel.send(f"🎴 **{p['name']}**님이 승리 핸드를 공개합니다:", file=discord.File(buf, "shown_hand.png"))
+            else:
+                await interaction.channel.send(f"🎴 **{p['name']}**님이 핸드를 공개하려 했으나 이미지 생성에 실패했습니다.")
+
+        # 3. 팟 지급 및 게임 종료 (원래 handle_single_winner의 나머지 로직)
+        p["coins"] += self.pot
+        await interaction.channel.send(f"💰 **{self.winner_name}**님이 팟 {self.pot} 코인을 획득했습니다!")
+        
+        # 4. 게임 종료 (DB 업데이트, 캐시 정리 등)
+        await end_game()
+
+    @discord.ui.button(label="핸드 공개", style=discord.ButtonStyle.success)
+    async def _show(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish_and_end_game(interaction, show=True)
+
+    @discord.ui.button(label="숨기기", style=discord.ButtonStyle.danger)
+    async def _hide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish_and_end_game(interaction, show=False)
+
+    async def on_timeout(self):
+        if self.already_acted:
+            return
+        self.already_acted = True
+        logging.info(f"ShowHandOnWinView timed out for {self.winner_uid}")
+        
+        channel = bot.get_channel(game["channel_id"])
+        if not channel:
+            logging.error("ShowHandOnWinView timeout: 채널을 찾을 수 없음")
+            return
+
+        p = players.get(self.winner_uid)
+        if not p:
+             logging.error(f"ShowHandOnWinView timeout: 승리자 {self.winner_uid} 정보를 찾을 수 없음")
+             await end_game()
+             return
+
+        p["coins"] += self.pot
+        await channel.send(f"💰 (시간 초과) **{self.winner_name}**님이 팟 {self.pot} 코인을 획득했습니다!")
+        
+        # 게임 종료
+        await end_game()
+
+# [추가] 폴드 시 10초간 핸드 공개 여부를 묻는 에페메럴 뷰
+class ShowHandOnFoldView(discord.ui.View):
+    def __init__(self, actor_id: int, channel: discord.abc.Messageable):
+        super().__init__(timeout=10.0)
+        self.actor_id = actor_id
+        self.channel = channel
+        self.already_acted = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("당신이 결정할 수 없습니다.", ephemeral=True)
+            return False
+        if self.already_acted:
+            await interaction.response.send_message("이미 결정했습니다.", ephemeral=True)
+            return False
+        return True
+
+    async def _finish(self, interaction: discord.Interaction, show: bool):
+        if self.already_acted:
+            await interaction.response.defer()
+            return
+        self.already_acted = True
+        
+        p = players.get(self.actor_id)
+        if not p:
+            await interaction.response.edit_message(content="플레이어 정보를 찾을 수 없습니다.", view=None)
+            return
+
+        if show:
+            cards = p.get("cards", [])
+            buf = compose(cards)
+            if buf:
+                await self.channel.send(f"🎴 **{p['name']}**님이 폴드하며 핸드를 공개합니다:", file=discord.File(buf, "shown_hand.png"))
+            else:
+                await self.channel.send(f"🎴 **{p['name']}**님이 핸드를 공개하려 했으나 이미지 생성에 실패했습니다.")
+
+        await interaction.response.edit_message(content="🚫 폴드 확인.", view=None)
+        
+        # 다음 턴 진행
+        await advance_or_next_round(self.channel)
+
+    @discord.ui.button(label="핸드 공개", style=discord.ButtonStyle.success)
+    async def _show(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, show=True)
+
+    @discord.ui.button(label="숨기기", style=discord.ButtonStyle.danger)
+    async def _hide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, show=False)
+
+    async def on_timeout(self):
+        if self.already_acted:
+            return
+        self.already_acted = True
+        logging.info(f"ShowHandOnFoldView timed out for {self.actor_id}")
+        
+        # 타임아웃 시 interaction이 없으므로 메시지를 수정할 수 없음.
+        # 그냥 다음 턴으로 진행
+        await advance_or_next_round(self.channel)
+
 class RaiseModal(discord.ui.Modal, title="레이즈 금액 입력"):
     def __init__(self, actor_id: int):
         super().__init__()
@@ -624,8 +782,10 @@ class ActionPromptView(discord.ui.View):
             await interaction.response.send_message("아직 네 차례가 아니야!", ephemeral=True); return False
         if not game["game_started"]:
             await interaction.response.send_message("게임이 시작되지 않았어요!", ephemeral=True); return False
-        if game["idx"] >= len(game["turn_order"]) or game["turn_order"][game["idx"]] != self.actor_id:
-            await interaction.response.send_message("이미 턴이 지나갔어요!", ephemeral=True); return False
+        
+        current_actor = game["turn_order"][game["idx"]]
+        if current_actor != self.actor_id:
+            await interaction.response.send_message(f"이미 턴이 지나갔어요! (현재: {players.get(current_actor, {}).get('name', '알수없음')})", ephemeral=True); return False
         return True
     
     @discord.ui.button(label="🎰 행동하기", style=discord.ButtonStyle.primary)
@@ -659,8 +819,16 @@ class ActionView(discord.ui.View):
         await handle_afk_fold(self.actor_id)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return game["game_started"] and game["idx"] < len(game["turn_order"]) and \
-            interaction.user.id == self.actor_id and game["turn_order"][game["idx"]] == self.actor_id
+        if not game["game_started"]:
+            await interaction.response.send_message("게임이 종료되었습니다.", ephemeral=True); return False
+        if game["idx"] >= len(game["turn_order"]):
+            await interaction.response.send_message("턴 정보가 없습니다.", ephemeral=True); return False
+            
+        current_actor = game["turn_order"][game["idx"]]
+        if interaction.user.id != self.actor_id or current_actor != self.actor_id:
+            await interaction.response.send_message("당신의 턴이 아니거나 턴이 지났습니다.", ephemeral=True); return False
+            
+        return True
     
     @discord.ui.button(label="체크", style=discord.ButtonStyle.secondary)
     async def _check(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -780,14 +948,25 @@ async def handle_raise(inter: discord.Interaction, uid: int, raise_amt: int):
     # 다음 턴으로
     await advance_or_next_round(inter.channel)
 
-
+# [수정] 폴드 시 핸드 공개 로직 추가
 async def handle_fold(inter: discord.Interaction, uid: int):
     p = players.get(uid)
     if not p: await inter.response.send_message("플레이어 정보를 찾을 수 없습니다!", ephemeral=True); return
+    
+    # 1. 일단 폴드 상태로 만듦
     p["folded"] = True
-    await inter.response.edit_message(content="🚫 폴드!", view=None)
     game["acted"].add(uid)
-    await advance_or_next_round(inter.channel)
+    
+    # 2. 이전 120초 타이머(ActionPromptView) 정리
+    await disable_prev_prompt(inter.channel)
+    
+    # 3. 10초짜리 "핸드 공개?" 뷰를 에페메럴 응답으로 보냄
+    view = ShowHandOnFoldView(actor_id=uid, channel=inter.channel)
+    await inter.response.edit_message(content="🚫 폴드했습니다. 핸드를 공개하시겠습니까?", view=view)
+    
+    # [중요] advance_or_next_round는 ShowHandOnFoldView의 콜백/타임아웃에서 호출됨
+    # (여기서는 advance_or_next_round를 호출하지 않음)
+
 
 async def handle_afk_fold(uid: int):
     """
